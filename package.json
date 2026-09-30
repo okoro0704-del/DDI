@@ -1,0 +1,25 @@
+{
+  "name": "@digiconomy/ddi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Digiconomy Digital Infrastructure Foundation V1",
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "migrate": "node scripts/migrate.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/pg": "^8.23.1",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "fastify": "^5.12.5",
+    "jose": "^6.2.12",
+    "pg": "^8.23.0"
+  }
+}
