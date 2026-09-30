@@ -143,12 +143,13 @@ export class DdiService {
     if (!owner.verified || !owner.ownerId) throw new Error("AUTHENTICATED_OWNER_REQUIRED");
     if (type === "PERSONAL") {
       const existing = [...this.store.infrastructures.values()].find(item => item.ownerId === owner.ownerId && item.type === "PERSONAL");
-      if (existing) return existing;
+      if (existing) { this.ensurePersonalIdentity(existing.id); return existing; }
     }
     const createdAt = now();
     const record: InfrastructureRecord = { id: id<InfrastructureId>("infra"), ownerId: owner.ownerId, type, status: "ACTIVE", applicationIds: [], primitiveBindingIds: [], relationshipIds: [], createdAt, updatedAt: createdAt, metadata };
     this.store.infrastructures.set(record.id, record);
     this.relationship(record.id, owner.ownerId, "OWNER");
+    if (type === "PERSONAL") this.ensurePersonalIdentity(record.id);
     return record;
   }
   registerApplication(input: Omit<ApplicationRecord, "id" | "createdAt" | "updatedAt" | "grantedCapabilities"> & { grantedCapabilities?: Capability[] }): ApplicationRecord {
@@ -172,9 +173,10 @@ export class DdiService {
   }
   bind(infrastructureId: InfrastructureId, namespace: PrimitiveBinding["namespace"], provider: Provider, configured = false, reference?: string) {
     const infrastructure = this.requiredInfrastructure(infrastructureId);
+    if (namespace === "identity" && infrastructure.type === "PERSONAL" && provider !== "TrustID") throw new Error("PROVIDER_LOCKED");
     const existing = [...this.store.bindings.values()].find(binding => binding.infrastructureId === infrastructureId && binding.namespace === namespace);
     if (existing) { if (existing.provider !== provider) throw new Error("PROVIDER_CONFLICT"); return existing; }
-    const binding = { id: id<PrimitiveBindingId>("binding"), infrastructureId, namespace, provider, configured, reference };
+    const binding = { id: id<PrimitiveBindingId>("binding"), infrastructureId, namespace, provider, configured, reference, management: reference === "SYSTEM_MANAGED" ? "SYSTEM_MANAGED" as const : undefined };
     this.store.bindings.set(binding.id, binding);
     infrastructure.primitiveBindingIds.push(binding.id);
     this.relationship(infrastructureId, binding.id, "PRIMITIVE_BINDING");
@@ -288,7 +290,15 @@ export class DdiService {
     for (const capability of capabilities) this.connectionAudit(connection, "CAPABILITY_REVOKED", correlationId, "REVOKED", capability);
     return connection;
   }
+  private ensurePersonalIdentity(infrastructureId: InfrastructureId) {
+    const infra = this.store.infrastructures.get(infrastructureId);
+    if (!infra || infra.type !== "PERSONAL") return;
+    const existing = [...this.store.bindings.values()].find(item => item.infrastructureId === infrastructureId && item.namespace === "identity");
+    if (existing) { if (existing.provider !== "TrustID") throw new Error("PROVIDER_CONFLICT"); return; }
+    this.bind(infrastructureId, "identity", "TrustID", true, "SYSTEM_MANAGED");
+  }
   async route(request: CapabilityRequest): Promise<CapabilityResult> {
+    if (request.capability.startsWith("identity.")) this.ensurePersonalIdentity(request.infrastructureId);
     const infra = this.store.infrastructures.get(request.infrastructureId) ?? null;
     const app = this.store.applications.get(request.applicationId) ?? null;
     const namespace = request.capability.split(".")[0] as PrimitiveBinding["namespace"];

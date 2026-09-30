@@ -78,6 +78,7 @@ export class DurableDdiService {
   getInfrastructure(id: string) { return this.repository.getInfrastructure(id); }
   async execute(request: CapabilityRequest): Promise<CapabilityResult> {
     try {
+      if (request.capability.startsWith("identity.")) await this.repository.ensurePersonalIdentity(request.infrastructureId);
       const [infrastructure, application, connections] = await Promise.all([this.repository.getInfrastructure(request.infrastructureId), this.repository.getApplication(request.applicationId), this.repository.listConnections(request.infrastructureId)]);
       const namespace = request.capability.split(".")[0] as PrimitiveBinding["namespace"];
       const binding = await this.repository.findBinding(request.infrastructureId, namespace);

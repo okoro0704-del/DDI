@@ -38,6 +38,7 @@ export class PostgresDdiRepository implements DdiRepository {
       if (!row) throw new Error("IDEMPOTENCY_MISSING");
       if (row.owner_id !== ownerId) throw new Error("IDEMPOTENCY_OWNER_MISMATCH");
       if (row.response?.id) {
+        if (input.type === "PERSONAL") await this.ensureIdentityBinding(client, row.response.id);
         const existing = await this.hydrate(client, row.response.id);
         if (!existing) throw new Error("IDEMPOTENCY_MISSING");
         return existing;
@@ -45,6 +46,7 @@ export class PostgresDdiRepository implements DdiRepository {
       if (input.type === "PERSONAL") {
         const canonical = await client.query<{ id: string }>(`SELECT id FROM ddi_infrastructures WHERE owner_id = $1 AND type = 'PERSONAL' FOR UPDATE`, [ownerId]);
         if (canonical.rows[0]) {
+          await this.ensureIdentityBinding(client, canonical.rows[0].id);
           const existing = await this.hydrate(client, canonical.rows[0].id);
           if (!existing) throw new Error("UNKNOWN_INFRASTRUCTURE");
           await client.query(`UPDATE ddi_idempotency SET response = $2::jsonb WHERE key = $1`, [input.idempotencyKey, JSON.stringify(existing)]);
@@ -61,6 +63,7 @@ export class PostgresDdiRepository implements DdiRepository {
         if (code !== "23505" || input.type !== "PERSONAL") throw error;
         await client.query("ROLLBACK TO SAVEPOINT ddi_personal_insert");
         const canonical = await client.query<{ id: string }>(`SELECT id FROM ddi_infrastructures WHERE owner_id = $1 AND type = 'PERSONAL'`, [ownerId]);
+        if (canonical.rows[0]) await this.ensureIdentityBinding(client, canonical.rows[0].id);
         const existing = canonical.rows[0] ? await this.hydrate(client, canonical.rows[0].id) : null;
         if (!existing) throw error;
         await client.query(`UPDATE ddi_idempotency SET response = $2::jsonb WHERE key = $1`, [input.idempotencyKey, JSON.stringify(existing)]);
@@ -69,6 +72,10 @@ export class PostgresDdiRepository implements DdiRepository {
       const relation: Relationship = { id: `relationship:${randomUUID()}` as Relationship["id"], from: infra.id, to: ownerId, type: "OWNER", createdAt: at };
       await client.query(`INSERT INTO ddi_relationships (id, source, target, relationship_type, status, metadata, created_at, updated_at) VALUES ($1, $2, $3, 'OWNER', 'ACTIVE', '{}'::jsonb, $4, $4)`, [relation.id, relation.from, relation.to, at]);
       infra.relationshipIds = [relation.id];
+      if (infra.type === "PERSONAL") {
+        const binding = await this.ensureIdentityBinding(client, infra.id);
+        if (binding) infra.primitiveBindingIds = [binding.id];
+      }
       await this.connectionEvent(client, { eventType: "PDI_CREATED", correlationId: input.idempotencyKey, ownerId, infrastructureId: infra.id, result: "CREATED", timestamp: at });
       await client.query(`UPDATE ddi_idempotency SET response = $2::jsonb WHERE key = $1`, [input.idempotencyKey, JSON.stringify(infra)]);
       return infra;
@@ -121,10 +128,32 @@ export class PostgresDdiRepository implements DdiRepository {
     });
   }
 
+  async ensurePersonalIdentity(infrastructureId: string) {
+    await this.transaction(async (client) => { await this.ensureIdentityBinding(client, infrastructureId); });
+  }
+
+  private async ensureIdentityBinding(client: PoolClient, infrastructureId: string) {
+    const infra = await client.query<{ owner_id: string | null; type: string }>(`SELECT owner_id, type FROM ddi_infrastructures WHERE id = $1 FOR UPDATE`, [infrastructureId]);
+    const row = infra.rows[0];
+    if (!row?.owner_id || row.type !== "PERSONAL") return null;
+    const existing = await client.query<BindingRow>(`SELECT id, infrastructure_id, namespace, provider, configured, provider_reference FROM ddi_primitive_bindings WHERE infrastructure_id = $1 AND namespace = 'identity' FOR UPDATE`, [infrastructureId]);
+    if (existing.rows[0]) {
+      if (existing.rows[0].provider !== "TrustID") throw new Error("PROVIDER_CONFLICT");
+      return mapBinding(existing.rows[0]);
+    }
+    const at = new Date().toISOString();
+    const inserted = await client.query<BindingRow>(`INSERT INTO ddi_primitive_bindings (id, infrastructure_id, namespace, provider, configured, provider_reference, created_at, updated_at) VALUES ($1,$2,'identity','TrustID',TRUE,'SYSTEM_MANAGED',$3,$3) RETURNING id, infrastructure_id, namespace, provider, configured, provider_reference`, [`binding:${randomUUID()}`, infrastructureId, at]);
+    const relationId = `relationship:${randomUUID()}`;
+    await client.query(`INSERT INTO ddi_relationships (id, source, target, relationship_type, status, metadata, created_at, updated_at) VALUES ($1,$2,$3,'PRIMITIVE_BINDING','ACTIVE','{}'::jsonb,$4,$4)`, [relationId, infrastructureId, inserted.rows[0]?.id, at]);
+    await client.query(`UPDATE ddi_infrastructures SET updated_at = $2 WHERE id = $1`, [infrastructureId, at]);
+    return inserted.rows[0] ? mapBinding(inserted.rows[0]) : null;
+  }
+
   async bind(ownerId: DigiOwnerId, infrastructureId: string, namespace: PrimitiveBinding["namespace"], provider: PrimitiveBinding["provider"], reference?: string): Promise<PrimitiveBinding> {
     return this.transaction(async (client) => {
       const infra = await this.hydrate(client, infrastructureId);
       if (!infra || infra.ownerId !== ownerId) throw new Error("OWNER_REQUIRED");
+      if (namespace === "identity" && infra.type === "PERSONAL" && provider !== "TrustID") throw new Error("PROVIDER_LOCKED");
       const at = new Date().toISOString();
       const inserted = await client.query<BindingRow>(`INSERT INTO ddi_primitive_bindings (id, infrastructure_id, namespace, provider, configured, provider_reference, created_at, updated_at) VALUES ($1,$2,$3,$4,TRUE,$5,$6,$6) ON CONFLICT (infrastructure_id, namespace) DO NOTHING RETURNING id, infrastructure_id, namespace, provider, configured, provider_reference`, [`binding:${randomUUID()}`, infrastructureId, namespace, provider, reference ?? null, at]);
       if (inserted.rows[0]) {
@@ -173,7 +202,9 @@ export class PostgresDdiRepository implements DdiRepository {
 
   async findPersonal(ownerId: DigiOwnerId) {
     const result = await this.pool.query<{ id: string }>(`SELECT id FROM ddi_infrastructures WHERE owner_id = $1 AND type = 'PERSONAL'`, [ownerId]);
-    return result.rows[0] ? this.getInfrastructure(result.rows[0].id) : null;
+    if (!result.rows[0]) return null;
+    await this.ensurePersonalIdentity(result.rows[0].id);
+    return this.getInfrastructure(result.rows[0].id);
   }
   async findApplicationByCredential(secret: string) {
     const hash = createHash("sha256").update(secret).digest("hex");
@@ -349,7 +380,8 @@ function mapApp(row: AppRow): ApplicationRecord {
   return { id: row.id as ApplicationRecord["id"], infrastructureId: row.infrastructure_id as ApplicationRecord["infrastructureId"], type: row.type, displayName: row.display_name, publicUrl: row.public_url ?? undefined, adminUrl: row.admin_url ?? undefined, status: row.status, requestedCapabilities: row.requested_capabilities, grantedCapabilities: row.granted_capabilities, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 function mapBinding(row: BindingRow): PrimitiveBinding {
-  return { id: row.id as PrimitiveBinding["id"], infrastructureId: row.infrastructure_id as PrimitiveBinding["infrastructureId"], namespace: row.namespace, provider: row.provider, configured: row.configured, reference: row.provider_reference ?? undefined };
+  const reference = row.provider_reference ?? undefined;
+  return { id: row.id as PrimitiveBinding["id"], infrastructureId: row.infrastructure_id as PrimitiveBinding["infrastructureId"], namespace: row.namespace, provider: row.provider, configured: row.configured, reference, management: reference === "SYSTEM_MANAGED" ? "SYSTEM_MANAGED" : undefined };
 }
 function mapRelation(row: RelationRow): Relationship {
   return { id: row.id as Relationship["id"], from: row.source, to: row.target, type: row.relationship_type, createdAt: iso(row.created_at) };
