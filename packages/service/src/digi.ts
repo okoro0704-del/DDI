@@ -59,6 +59,70 @@ export class HttpDigiAuthorityClient implements DigiAuthorityClient {
   }
 }
 
+type ListedGrant = { id: string; actorType: string; actorId: string; actions: string[]; resources: string[]; audience: string; status: string; oneTime?: boolean };
+
+/** PDI connection approval uses the public Authority routes and explicitly requests a reusable grant. */
+export class HttpDigiAuthorityGrantClient {
+  private baseUrl: string;
+  constructor(baseUrl: string) { this.baseUrl = baseUrl; }
+  async ensureGrant(input: { ownerId: string; actor: string; action: string; resource: string; audience: string; sessionToken?: string }) {
+    if (!input.sessionToken) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+    const headers = { authorization: `Bearer ${input.sessionToken}`, "content-type": "application/json" };
+    let listed: Response;
+    try { listed = await fetch(new URL("/authority/grants/active", this.baseUrl), { headers }); }
+    catch { throw new Error("AUTHORITY_GRANT_UNAVAILABLE"); }
+    if (listed.ok) {
+      const body = await readJson<{ grants?: ListedGrant[] }>(listed);
+      const found = body.grants?.find(grant => reusableMatch(grant, input));
+      if (found) return { grantId: found.id };
+    } else if (listed.status >= 500) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+    let checked: Response;
+    try { checked = await fetch(new URL("/authority/check", this.baseUrl), { method: "POST", headers, body: JSON.stringify({ actor: input.actor, action: input.action, resource: input.resource, audience: input.audience, ownerId: input.ownerId }) }); }
+    catch { throw new Error("AUTHORITY_GRANT_UNAVAILABLE"); }
+    if (checked.status >= 500) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+    const decision = await readJson<{ decision?: string; grantId?: string; requestId?: string }>(checked);
+    if ((decision.decision === "ALLOW" || decision.decision === "ALLOW_WITH_LIMITS") && decision.grantId) {
+      await this.requireReusable(decision.grantId, headers);
+      return { grantId: decision.grantId };
+    }
+    if (decision.decision === "ASK_OWNER" && decision.requestId) {
+      let approved: Response;
+      try { approved = await fetch(new URL(`/authority/requests/${decision.requestId}/approve`, this.baseUrl), { method: "POST", headers, body: JSON.stringify({ oneTime: false }) }); }
+      catch { throw new Error("AUTHORITY_GRANT_UNAVAILABLE"); }
+      if (approved.status >= 500) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+      if (!approved.ok) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+      const body = await readJson<{ grantId?: string; oneTime?: boolean }>(approved);
+      if (!body.grantId || body.oneTime === undefined) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+      if (body.oneTime !== false) throw new Error("AUTHORITY_GRANT_NOT_REUSABLE");
+      return { grantId: body.grantId };
+    }
+    throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+  }
+  private async requireReusable(grantId: string, headers: { authorization: string; "content-type": string }) {
+    let response: Response;
+    try { response = await fetch(new URL(`/authority/grants/${grantId}`, this.baseUrl), { headers }); }
+    catch { throw new Error("AUTHORITY_GRANT_UNAVAILABLE"); }
+    if (!response.ok) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+    const body = await readJson<{ grant?: { status?: string; oneTime?: boolean } }>(response);
+    if (body.grant?.status !== "ACTIVE" || body.grant.oneTime !== false) throw new Error("AUTHORITY_GRANT_NOT_REUSABLE");
+  }
+  async revokeGrant(input: { ownerId: string; grantId: string; sessionToken?: string }) {
+    if (!input.sessionToken) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+    const response = await fetch(new URL(`/authority/grants/${input.grantId}/revoke`, this.baseUrl), { method: "POST", headers: { authorization: `Bearer ${input.sessionToken}` } });
+    if (!response.ok) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+  }
+}
+
+function reusableMatch(grant: ListedGrant, input: { actor: string; action: string; resource: string; audience: string }) {
+  const split = input.actor.indexOf(":");
+  return grant.status === "ACTIVE" && grant.oneTime === false && grant.actorType === input.actor.slice(0, split) && grant.actorId === input.actor.slice(split + 1) && grant.audience === input.audience && grant.actions.includes(input.action) && grant.resources.includes(input.resource);
+}
+
+async function readJson<T>(response: Response): Promise<T> {
+  try { return await response.json() as T; }
+  catch { throw new Error("AUTHORITY_GRANT_UNAVAILABLE"); }
+}
+
 export function defaultAuthorityVerifierUrl() {
   return pathToFileURL("C:/Users/Hp/Desktop/TRUST ID/packages/authority-verifier/dist/index.js").href;
 }

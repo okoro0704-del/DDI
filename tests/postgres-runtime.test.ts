@@ -45,6 +45,7 @@ describe("DDI postgres runtime", { concurrency: 1 }, () => {
     pool = new Pool({ connectionString: databaseUrl, max: 12, connectionTimeoutMillis: 5000, options: `-c search_path=${SCHEMA}` });
     await migrate(pool, join("migrations", "001_ddi_foundation.sql"));
     await migrate(pool, join("migrations", "002_ddi_runtime.sql"));
+    await migrate(pool, join("migrations", "003_pdi_connections.sql"));
     repository = new PostgresDdiRepository(pool);
   });
   after(async () => { await pool?.end(); });
@@ -62,7 +63,7 @@ describe("DDI postgres runtime", { concurrency: 1 }, () => {
     assert.equal(await count(pool, "ddi_infrastructures"), 0);
   });
 
-  test("canonical Digi owner, restart, grants, and duplicate personal rows", async () => {
+  test("canonical Digi owner, restart, one personal PDI, and creator execution", async () => {
     const bridge = await import(bridgeUrl) as {
       openPostgresDigiCore(url: string, options: { schema: string }): Promise<{ owners: { findByIssuerSubject(issuer: string, subject: string): Promise<{ ownerId: string; subject: string } | null> }; replay: unknown; sessions: { resolve(token: string): Promise<{ id: string; ownerId: string } | null> }; runWrite<T>(fn: () => Promise<T>): Promise<T>; close(): Promise<void> }>;
       exchangeTrustIdAssertion(input: Record<string, unknown>): Promise<{ ok: true; ownerId: string; sessionToken: string; subject: string } | { ok: false; reason: string }>;
@@ -96,10 +97,10 @@ describe("DDI postgres runtime", { concurrency: 1 }, () => {
       const rejected = await bridge.exchangeTrustIdAssertion({ assertion: bad, expectedIssuer: ISSUER, expectedAudience: AUDIENCE, jwks, owners: core.owners, replay: core.replay, sessions: core.sessions, runWrite: core.runWrite });
       assert.equal(rejected.ok, false);
       const actor: Actor = { ownerId: first.ownerId as Actor["ownerId"], subject: "subject-ddi-proof", kind: "HUMAN", verified: true, authorityActor: "human:ddi-user" };
-      const service = new DurableDdiService(repository, async () => ({ ok: true, grantId: "grant:fixture" }), defaultAdapters(async () => ({ subject: "subject-ddi-proof" })));
+      const service = new DurableDdiService(repository, async () => ({ ok: true, grantId: "grant:fixture" }), defaultAdapters(async () => ({ subject: "subject-ddi-proof" })), undefined, { async ensureGrant() { return { grantId: "grant:fixture" }; }, async revokeGrant() { return undefined; } });
       const personalA = await service.provision(actor, { type: "PERSONAL", idempotencyKey: "personal-a" });
       const personalB = await service.provision(actor, { type: "PERSONAL", idempotencyKey: "personal-b" });
-      assert.notEqual(personalA.id, personalB.id);
+      assert.equal(personalB.id, personalA.id);
       const infra = await service.provision(actor, { type: "CREATOR", idempotencyKey: "creator-1" });
       const retried = await service.provision(actor, { type: "CREATOR", idempotencyKey: "creator-1" });
       assert.equal(retried.id, infra.id);
@@ -108,6 +109,8 @@ describe("DDI postgres runtime", { concurrency: 1 }, () => {
       const granted = await service.grantCapabilities(actor, infra.id, app.id, ["identity.currentActor"]);
       assert.deepEqual(granted.grantedCapabilities, ["identity.currentActor"]);
       await service.bind(actor, infra.id, "identity", "TrustID", "trustid:configured");
+      const connection = await service.requestConnection(app.id, ["identity.currentActor"], "request-1", "connection-creator");
+      await service.approveConnection(actor, connection.id, ["identity.currentActor"], "approve-1");
       const result = await service.execute({ infrastructureId: infra.id, applicationId: app.id, capability: "identity.currentActor", action: "identity.currentActor", resource: `infrastructure:${infra.id}`, audience: "ddi", actor, authority: { token: "fixture" }, correlationId: "allow-1", executionMode: "SPACE", payload: { assertion: "not-a-token" } });
       assert.equal(result.status, "COMPLETED");
       assert.equal((result.data as { ownerId: string; subject: string }).ownerId, first.ownerId);
@@ -175,12 +178,13 @@ describe("DDI postgres runtime", { concurrency: 1 }, () => {
       const used = await service.useToken({ token: input.token, expectedAudience: input.audience, expectedActor: input.actor, expectedAction: input.action, expectedResource: input.resource });
       return used.ok && used.grantId ? { ok: true as const, grantId: used.grantId } : mapAuthorityReason(used.reason ?? "INVALID");
     } };
-    const durable = new DurableDdiService(repository, authorityVerifier(client), defaultAdapters(async () => ({ subject: "subject-ddi-proof" })));
+    const durable = new DurableDdiService(repository, authorityVerifier(client), defaultAdapters(async () => ({ subject: "subject-ddi-proof" })), undefined, { async ensureGrant() { return { grantId: "grant:connection" }; }, async revokeGrant() { return undefined; } });
     const actor: Actor = { ownerId: ownerId as Actor["ownerId"], kind: "HUMAN", verified: true, authorityActor: actorKey };
     const infra = await durable.provision(actor, { type: "BUSINESS", idempotencyKey: `authority-${randomUUID()}` });
     const app = await durable.registerApp(actor, infra.id, { type: "REFERENCE", displayName: "Authority", capabilities: ["identity.currentActor"], idempotencyKey: `authority-app-${randomUUID()}` });
-    await durable.grantCapabilities(actor, infra.id, app.id, ["identity.currentActor"]);
     await durable.bind(actor, infra.id, "identity", "TrustID");
+    const connection = await durable.requestConnection(app.id, ["identity.currentActor"], "authority-connection", `authority-connection-${randomUUID()}`);
+    await durable.approveConnection(actor, connection.id, ["identity.currentActor"], "authority-approve");
     const execute = (token: string, changes: Partial<{ action: string; resource: string; audience: string; actor: string; ownerId: string }> = {}) => durable.execute({ infrastructureId: infra.id, applicationId: app.id, capability: "identity.currentActor", action: changes.action ?? "identity.currentActor", resource: changes.resource ?? "infrastructure:owned", audience: changes.audience ?? "ddi", actor: { ...actor, ownerId: (changes.ownerId ?? ownerId) as Actor["ownerId"], authorityActor: changes.actor ?? actorKey }, authority: { token }, correlationId: randomUUID() });
     const once = await grant(true);
     const wrongOwner = await client.consume({ token: once.token, audience: "ddi", actor: actorKey, action: "identity.currentActor", resource: "infrastructure:owned", ownerId: "own_wrong" });

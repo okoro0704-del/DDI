@@ -1,6 +1,6 @@
 import { Pool } from "pg";
 import { readConfig } from "../../../packages/service/src/config.ts";
-import { HttpDigiAuthorityClient, HttpDigiSessionClient, defaultAuthorityVerifierUrl } from "../../../packages/service/src/digi.ts";
+import { HttpDigiAuthorityClient, HttpDigiAuthorityGrantClient, HttpDigiSessionClient, defaultAuthorityVerifierUrl } from "../../../packages/service/src/digi.ts";
 import { postgresHealth } from "../../../packages/service/src/postgres.ts";
 import { PostgresDdiRepository } from "../../../packages/service/src/postgres-repository.ts";
 import { DurableDdiService, authorityVerifier, defaultAdapters } from "../../../packages/service/src/runtime.ts";
@@ -23,6 +23,7 @@ export async function composeRuntime(env: NodeJS.ProcessEnv = process.env) {
     authorityVerifier(new HttpDigiAuthorityClient({ consumeUrl: new URL("/v1/authority/consume", config.digiAuthorityUrl).href, jwksUrl: config.digiAuthorityJwksUrl, verifierModuleUrl: defaultAuthorityVerifierUrl() })),
     defaultAdapters(assertion => identityVerifier.verify(assertion)),
     new HttpDigiSessionClient(config.digiCoreUrl),
+    new HttpDigiAuthorityGrantClient(config.digiAuthorityUrl),
   );
   const app = buildApi({ service, config, database: () => postgresHealth(pool), identity: () => identityVerifier.health() });
   return { app, pool, config, service };

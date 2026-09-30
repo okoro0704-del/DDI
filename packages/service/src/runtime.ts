@@ -1,7 +1,7 @@
 import type { Actor, Capability, CapabilityRequest, CapabilityResult, InfrastructureType, PrimitiveBinding } from "../../contracts/src/index.ts";
 import { TrustIdAdapter, UnavailableAdapter, executeCapability, type AuthorityVerifier, type PrimitiveAdapter } from "../../core/src/index.ts";
 import type { DigiAuthorityClient, DigiSessionClient } from "./digi.ts";
-import type { DdiRepository } from "./repository.ts";
+import type { AuthorityGrantPort, DdiRepository } from "./repository.ts";
 
 export function authorityVerifier(client: DigiAuthorityClient): AuthorityVerifier {
   return async ({ request }) => {
@@ -25,17 +25,40 @@ export class DurableDdiService {
   private authority: AuthorityVerifier;
   private adapters: Map<string, PrimitiveAdapter>;
   private sessions: DigiSessionClient | undefined;
-  constructor(repository: DdiRepository, authority: AuthorityVerifier, adapters: Map<string, PrimitiveAdapter>, sessions?: DigiSessionClient) {
+  private grants: AuthorityGrantPort | undefined;
+  constructor(repository: DdiRepository, authority: AuthorityVerifier, adapters: Map<string, PrimitiveAdapter>, sessions?: DigiSessionClient, grants?: AuthorityGrantPort) {
     this.repository = repository;
     this.authority = authority;
     this.adapters = adapters;
     this.sessions = sessions;
+    this.grants = grants;
   }
   async authenticate(token: string): Promise<Actor | null> {
     const session = await this.sessions?.resolve(token);
     if (!session) return null;
     return { ownerId: session.ownerId, kind: "HUMAN", verified: true };
   }
+  authenticateApplication(secret: string) { return this.repository.findApplicationByCredential(secret); }
+  findPersonal(actor: Actor) { if (!actor.verified || !actor.ownerId) throw new Error("OWNER_REQUIRED"); return this.repository.findPersonal(actor.ownerId); }
+  requestConnection(applicationId: string, capabilities: Capability[], correlationId: string, idempotencyKey: string) { return this.repository.requestConnection(applicationId, capabilities, correlationId, idempotencyKey); }
+  requestCapabilityChange(applicationId: string, capabilities: Capability[], correlationId: string) { return this.repository.requestCapabilityChange(applicationId, capabilities, correlationId); }
+  approveConnection(actor: Actor, connectionId: string, capabilities: Capability[], correlationId: string, sessionToken?: string) {
+    if (!actor.verified || !actor.ownerId) throw new Error("OWNER_REQUIRED");
+    if (!this.grants) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+    return this.repository.approveConnection(actor.ownerId, connectionId, capabilities, correlationId, this.grants, sessionToken);
+  }
+  revokeConnection(actor: Actor, connectionId: string, correlationId: string, sessionToken?: string) {
+    if (!actor.verified || !actor.ownerId) throw new Error("OWNER_REQUIRED");
+    if (!this.grants) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+    return this.repository.revokeConnection(actor.ownerId, connectionId, correlationId, this.grants, sessionToken);
+  }
+  revokeCapabilities(actor: Actor, connectionId: string, capabilities: Capability[], correlationId: string, sessionToken?: string) {
+    if (!actor.verified || !actor.ownerId) throw new Error("OWNER_REQUIRED");
+    if (!this.grants) throw new Error("AUTHORITY_GRANT_UNAVAILABLE");
+    return this.repository.revokeCapabilities(actor.ownerId, connectionId, capabilities, correlationId, this.grants, sessionToken);
+  }
+  getConnection(id: string) { return this.repository.getConnection(id); }
+  listConnections(infrastructureId: string) { return this.repository.listConnections(infrastructureId); }
   provision(actor: Actor, input: { type: InfrastructureType; metadata?: Record<string, string>; idempotencyKey: string }) {
     if (!actor.verified || !actor.ownerId || !input.idempotencyKey) throw new Error("AUTHENTICATED_ACTOR_AND_IDEMPOTENCY_REQUIRED");
     return this.repository.provision(actor.ownerId, input);
@@ -55,10 +78,11 @@ export class DurableDdiService {
   getInfrastructure(id: string) { return this.repository.getInfrastructure(id); }
   async execute(request: CapabilityRequest): Promise<CapabilityResult> {
     try {
-      const [infrastructure, application] = await Promise.all([this.repository.getInfrastructure(request.infrastructureId), this.repository.getApplication(request.applicationId)]);
+      const [infrastructure, application, connections] = await Promise.all([this.repository.getInfrastructure(request.infrastructureId), this.repository.getApplication(request.applicationId), this.repository.listConnections(request.infrastructureId)]);
       const namespace = request.capability.split(".")[0] as PrimitiveBinding["namespace"];
       const binding = await this.repository.findBinding(request.infrastructureId, namespace);
-      const outcome = await executeCapability({ request, infrastructure, application, binding, adapters: [...this.adapters.values()], authority: this.authority });
+      const connection = connections.find(item => item.applicationId === request.applicationId) ?? null;
+      const outcome = await executeCapability({ request, infrastructure, application, binding, connection, adapters: [...this.adapters.values()], authority: this.authority });
       try { await this.repository.insertAudit(outcome.audit); }
       catch { return { status: "FAILED", correlationId: request.correlationId, reason: "AUDIT_UNAVAILABLE" }; }
       return outcome.result;

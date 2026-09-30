@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"; import { dirname } from "node:path";
-import type { ApplicationRecord, AuditRecord, InfrastructureRecord, PrimitiveBinding, Relationship } from "../../contracts/src/index.ts";
-export type PersistentState = { infrastructures: InfrastructureRecord[]; applications: ApplicationRecord[]; bindings: PrimitiveBinding[]; relationships: Relationship[]; audits: AuditRecord[]; idempotency: Record<string, InfrastructureRecord> };
-const empty = (): PersistentState => ({ infrastructures: [], applications: [], bindings: [], relationships: [], audits: [], idempotency: {} });
+import type { ApplicationRecord, AuditRecord, ConnectionAuditRecord, InfrastructureRecord, PdiApplicationConnection, PrimitiveBinding, Relationship } from "../../contracts/src/index.ts";
+export type PersistentState = { infrastructures: InfrastructureRecord[]; applications: ApplicationRecord[]; bindings: PrimitiveBinding[]; relationships: Relationship[]; connections: PdiApplicationConnection[]; connectionAudits: ConnectionAuditRecord[]; audits: AuditRecord[]; idempotency: Record<string, InfrastructureRecord> };
+const empty = (): PersistentState => ({ infrastructures: [], applications: [], bindings: [], relationships: [], connections: [], connectionAudits: [], audits: [], idempotency: {} });
 /** Deterministic local/test persistence only. Production must use PostgreSQL. */
 export class JsonTestStore { private path: string; constructor(path: string) { this.path = path; } async load() { try { return JSON.parse(await readFile(this.path, "utf8")) as PersistentState; } catch (error: any) { if (error?.code === "ENOENT") return empty(); throw error; } } async save(state: PersistentState) { await mkdir(dirname(this.path), { recursive: true }); const temporary = `${this.path}.tmp`; await writeFile(temporary, JSON.stringify(state), "utf8"); await rename(temporary, this.path); } }
