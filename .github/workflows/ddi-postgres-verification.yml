@@ -73,5 +73,7 @@ jobs:
               tail -n 200 /tmp/ddi-test.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+            diagnostic=$(tail -n 80 /tmp/ddi-test.log | tr '\n' ' ')
+            echo "::error title=DDI sanitized test failure::$diagnostic"
           fi
           exit "$status"
