@@ -43,6 +43,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: okoro0704-del/elfCOM
+          ref: f0b7e7213e4b0c8bf0efe560212ec1cd3764bdbf
           path: elfcom
       - uses: actions/setup-node@v4
         with:
