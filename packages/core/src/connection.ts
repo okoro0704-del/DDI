@@ -4,6 +4,7 @@ import type { AuthorityGrantRef, Capability, InfrastructureId } from "../../cont
 const descriptions: Record<string, string> = {
   "identity.currentActor": "Identify the current Digi owner of this Personal Digital Infrastructure.",
   "identity.read": "Read identity attributes the owner has made available to this application.",
+  "communication.inbox": "Read the conversation list of the communication primitive connected to this PDI.",
   "communication.send": "Send a communication through the communication primitive connected to this PDI.",
   "data.read": "Read data the owner approves for this application.",
 };

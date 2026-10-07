@@ -28,6 +28,7 @@ export interface DdiRepository {
   getInfrastructure(id: string): Promise<InfrastructureRecord | null>;
   getApplication(id: string): Promise<ApplicationRecord | null>;
   ensurePersonalIdentity(infrastructureId: string): Promise<void>;
+  ensurePersonalCommunication(infrastructureId: string): Promise<void>;
   findBinding(infrastructureId: string, namespace: PrimitiveBinding["namespace"]): Promise<PrimitiveBinding | null>;
   insertAudit(audit: AuditRecord): Promise<void>;
   snapshot(): Promise<PersistentState>;

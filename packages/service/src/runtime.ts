@@ -1,5 +1,5 @@
 import type { Actor, Capability, CapabilityRequest, CapabilityResult, InfrastructureType, PrimitiveBinding } from "../../contracts/src/index.ts";
-import { TrustIdAdapter, UnavailableAdapter, executeCapability, type AuthorityVerifier, type PrimitiveAdapter } from "../../core/src/index.ts";
+import { ElfComAdapter, TrustIdAdapter, UnavailableAdapter, executeCapability, type AuthorityVerifier, type PrimitiveAdapter } from "../../core/src/index.ts";
 import type { DigiAuthorityClient, DigiSessionClient } from "./digi.ts";
 import type { AuthorityGrantPort, DdiRepository } from "./repository.ts";
 
@@ -12,10 +12,11 @@ export function authorityVerifier(client: DigiAuthorityClient): AuthorityVerifie
   };
 }
 
-export function defaultAdapters(verify: (assertion: string) => Promise<{ subject?: string } | null>): Map<string, PrimitiveAdapter> {
+export function defaultAdapters(verify: (assertion: string) => Promise<{ subject?: string } | null>, elfcom: { baseUrl?: string; serviceToken?: string } = {}): Map<string, PrimitiveAdapter> {
   const adapters = new Map<string, PrimitiveAdapter>();
   adapters.set("identity", new TrustIdAdapter(verify));
-  for (const [namespace, provider] of [["communication", "ElfCom"], ["data", "DataZone"], ["jobs", "PlatformJobs"], ["distribution", "MasterDistributor"], ["value", "FundzMan"], ["intelligence", "DigiAI"]] as const) adapters.set(namespace, new UnavailableAdapter(namespace, provider));
+  adapters.set("communication", new ElfComAdapter({ baseUrl: elfcom.baseUrl ?? process.env.ELFCOM_BASE_URL, serviceToken: elfcom.serviceToken ?? process.env.ELFCOM_PDI_SERVICE_TOKEN }));
+  for (const [namespace, provider] of [["data", "DataZone"], ["jobs", "PlatformJobs"], ["distribution", "MasterDistributor"], ["value", "FundzMan"], ["intelligence", "DigiAI"]] as const) adapters.set(namespace, new UnavailableAdapter(namespace, provider));
   return adapters;
 }
 
@@ -79,6 +80,7 @@ export class DurableDdiService {
   async execute(request: CapabilityRequest): Promise<CapabilityResult> {
     try {
       if (request.capability.startsWith("identity.")) await this.repository.ensurePersonalIdentity(request.infrastructureId);
+      if (request.capability.startsWith("communication.")) await this.repository.ensurePersonalCommunication(request.infrastructureId);
       const [infrastructure, application, connections] = await Promise.all([this.repository.getInfrastructure(request.infrastructureId), this.repository.getApplication(request.applicationId), this.repository.listConnections(request.infrastructureId)]);
       const namespace = request.capability.split(".")[0] as PrimitiveBinding["namespace"];
       const binding = await this.repository.findBinding(request.infrastructureId, namespace);

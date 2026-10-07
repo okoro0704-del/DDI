@@ -17,6 +17,53 @@ export class InMemoryDdiStore {
   audits: AuditRecord[] = [];
 }
 
+/** ElfCom mailbox key derived from the Digi owner. Applications cannot choose it. */
+export function elfcomAccountRef(ownerId: string) {
+  return `elfcom:${ownerId}`;
+}
+
+export function communicationBindingReference(ownerId: string) {
+  return `SYSTEM_MANAGED:${elfcomAccountRef(ownerId)}`;
+}
+
+/** ElfCom remains the communication primitive. The Digi ownerId is the only account key. */
+export class ElfComAdapter implements PrimitiveAdapter {
+  namespace = "communication" as const;
+  provider = "ElfCom" as const;
+  private baseUrl: string;
+  private serviceToken: string;
+  private fetchImpl: typeof fetch;
+  constructor(options: { baseUrl?: string; serviceToken?: string; fetchImpl?: typeof fetch } = {}) {
+    this.baseUrl = options.baseUrl?.replace(/\/$/, "") ?? "";
+    this.serviceToken = options.serviceToken ?? "";
+    this.fetchImpl = options.fetchImpl ?? fetch;
+  }
+  async resolve(binding: PrimitiveBinding) {
+    if (!binding.configured) return { ok: false as const, reason: "PROVIDER_NOT_CONFIGURED" };
+    if (!this.baseUrl || !this.serviceToken) return { ok: false as const, reason: "PROVIDER_UNAVAILABLE" };
+    return { ok: true as const };
+  }
+  async execute(request: CapabilityRequest): Promise<CapabilityResult> {
+    const ownerId = request.actor?.ownerId;
+    if (!ownerId) return { status: "AUTHENTICATION_REQUIRED", correlationId: request.correlationId, provider: this.provider, reason: "VERIFIED_ACTOR_REQUIRED" };
+    if (request.capability !== "communication.inbox") return { status: "FAILED", correlationId: request.correlationId, provider: this.provider, reason: "INVALID_REQUEST" };
+    const accountRef = elfcomAccountRef(ownerId);
+    try {
+      const response = await this.fetchImpl(new URL(`/v1/pdi/inbox?ownerRef=${encodeURIComponent(accountRef)}`, this.baseUrl), {
+        headers: { authorization: `Bearer ${this.serviceToken}` },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!response.ok) return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: "PROVIDER_UNAVAILABLE" };
+      const body = await response.json() as { ownerRef?: string; threads?: Array<{ id: string; channel: string; peerRef?: string; unreadCount?: number }> };
+      if (body.ownerRef !== accountRef || !Array.isArray(body.threads)) return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: "PROVIDER_UNAVAILABLE" };
+      return { status: "COMPLETED", correlationId: request.correlationId, provider: this.provider, data: { ownerId, accountRef, threads: body.threads.map(thread => ({ id: thread.id, channel: thread.channel, peerRef: thread.peerRef, unreadCount: thread.unreadCount ?? 0 })) } };
+    } catch {
+      return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: "PROVIDER_UNAVAILABLE" };
+    }
+  }
+  async health() { return this.baseUrl && this.serviceToken ? "CONNECTED" as const : "UNAVAILABLE" as const; }
+}
+
 export class UnavailableAdapter implements PrimitiveAdapter {
   namespace: PrimitiveBinding["namespace"];
   provider: Provider;
@@ -128,6 +175,10 @@ export async function executeCapability(input: {
   try {
     const resolved = await adapter.resolve(binding);
     if (!resolved.ok) return finish({ status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: binding.provider, reason: resolved.reason });
+    if (binding.namespace === "communication" && binding.provider === "ElfCom" && binding.configured) {
+      const expected = communicationBindingReference(request.actor.ownerId);
+      if (binding.reference !== expected) return finish({ status: "DENIED", correlationId: request.correlationId, provider: binding.provider, reason: binding.reference?.startsWith("SYSTEM_MANAGED:elfcom:") ? "OWNER_MISMATCH" : "PROVIDER_NOT_CONFIGURED" });
+    }
     return finish(await adapter.execute(request), decision.grantId);
   } catch {
     return finish({ status: "FAILED", correlationId: request.correlationId, provider: binding.provider, reason: "ADAPTER_FAILED" });
@@ -143,13 +194,13 @@ export class DdiService {
     if (!owner.verified || !owner.ownerId) throw new Error("AUTHENTICATED_OWNER_REQUIRED");
     if (type === "PERSONAL") {
       const existing = [...this.store.infrastructures.values()].find(item => item.ownerId === owner.ownerId && item.type === "PERSONAL");
-      if (existing) { this.ensurePersonalIdentity(existing.id); return existing; }
+      if (existing) { this.ensurePersonalIdentity(existing.id); this.ensurePersonalCommunication(existing.id); return existing; }
     }
     const createdAt = now();
     const record: InfrastructureRecord = { id: id<InfrastructureId>("infra"), ownerId: owner.ownerId, type, status: "ACTIVE", applicationIds: [], primitiveBindingIds: [], relationshipIds: [], createdAt, updatedAt: createdAt, metadata };
     this.store.infrastructures.set(record.id, record);
     this.relationship(record.id, owner.ownerId, "OWNER");
-    if (type === "PERSONAL") this.ensurePersonalIdentity(record.id);
+    if (type === "PERSONAL") { this.ensurePersonalIdentity(record.id); this.ensurePersonalCommunication(record.id); }
     return record;
   }
   registerApplication(input: Omit<ApplicationRecord, "id" | "createdAt" | "updatedAt" | "grantedCapabilities"> & { grantedCapabilities?: Capability[] }): ApplicationRecord {
@@ -174,9 +225,10 @@ export class DdiService {
   bind(infrastructureId: InfrastructureId, namespace: PrimitiveBinding["namespace"], provider: Provider, configured = false, reference?: string) {
     const infrastructure = this.requiredInfrastructure(infrastructureId);
     if (namespace === "identity" && infrastructure.type === "PERSONAL" && provider !== "TrustID") throw new Error("PROVIDER_LOCKED");
+    if (namespace === "communication" && infrastructure.type === "PERSONAL" && provider !== "ElfCom") throw new Error("PROVIDER_LOCKED");
     const existing = [...this.store.bindings.values()].find(binding => binding.infrastructureId === infrastructureId && binding.namespace === namespace);
     if (existing) { if (existing.provider !== provider) throw new Error("PROVIDER_CONFLICT"); return existing; }
-    const binding = { id: id<PrimitiveBindingId>("binding"), infrastructureId, namespace, provider, configured, reference, management: reference === "SYSTEM_MANAGED" ? "SYSTEM_MANAGED" as const : undefined };
+    const binding = { id: id<PrimitiveBindingId>("binding"), infrastructureId, namespace, provider, configured, reference, management: reference === "SYSTEM_MANAGED" || reference?.startsWith("SYSTEM_MANAGED:") ? "SYSTEM_MANAGED" as const : undefined };
     this.store.bindings.set(binding.id, binding);
     infrastructure.primitiveBindingIds.push(binding.id);
     this.relationship(infrastructureId, binding.id, "PRIMITIVE_BINDING");
@@ -297,8 +349,16 @@ export class DdiService {
     if (existing) { if (existing.provider !== "TrustID") throw new Error("PROVIDER_CONFLICT"); return; }
     this.bind(infrastructureId, "identity", "TrustID", true, "SYSTEM_MANAGED");
   }
+  private ensurePersonalCommunication(infrastructureId: InfrastructureId) {
+    const infra = this.store.infrastructures.get(infrastructureId);
+    if (!infra || infra.type !== "PERSONAL" || !infra.ownerId) return;
+    const existing = [...this.store.bindings.values()].find(item => item.infrastructureId === infrastructureId && item.namespace === "communication");
+    if (existing) { if (existing.provider !== "ElfCom") throw new Error("PROVIDER_CONFLICT"); return; }
+    this.bind(infrastructureId, "communication", "ElfCom", true, communicationBindingReference(infra.ownerId));
+  }
   async route(request: CapabilityRequest): Promise<CapabilityResult> {
     if (request.capability.startsWith("identity.")) this.ensurePersonalIdentity(request.infrastructureId);
+    if (request.capability.startsWith("communication.")) this.ensurePersonalCommunication(request.infrastructureId);
     const infra = this.store.infrastructures.get(request.infrastructureId) ?? null;
     const app = this.store.applications.get(request.applicationId) ?? null;
     const namespace = request.capability.split(".")[0] as PrimitiveBinding["namespace"];
