@@ -68,7 +68,8 @@ describe("PDI identity primitive binding", { concurrency: 1 }, () => {
     const again = await repository.provision(item.current.ownerId, { type: "PERSONAL", idempotencyKey: "binding-new-repeat" });
     assert.equal(again.id, item.infra.id);
     const repeated = await pool.query<{ namespace: string; n: string }>(`SELECT namespace, count(*)::text AS n FROM ddi_primitive_bindings WHERE infrastructure_id = $1 GROUP BY namespace ORDER BY namespace`, [item.infra.id]);
-    assert.deepEqual(repeated.rows.map(row => [row.namespace, Number(row.n)]), [["communication", 1], ["identity", 1]]);
+    assert.deepEqual(repeated.rows.map(row => [row.namespace, Number(row.n)]), [["identity", 1]]);
+    assert.equal(await repository.findBinding(item.infra.id, "communication"), null);
     await assert.rejects(repository.bind(item.current.ownerId, item.infra.id, "identity", "ElfCom"), /PROVIDER_LOCKED|PROVIDER_CONFLICT/);
     const creator = await repository.provision(item.current.ownerId, { type: "CREATOR", idempotencyKey: "creator-no-identity" });
     assert.equal(await repository.findBinding(creator.id, "identity"), null);

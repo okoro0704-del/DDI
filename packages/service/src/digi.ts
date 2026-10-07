@@ -1,7 +1,7 @@
-import { pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url"; import { join } from "node:path";
 import type { AuthorityDecision, DigiOwnerId } from "../../contracts/src/index.ts";
 
-export type DigiSession = { ownerId: DigiOwnerId; sessionId: string };
+export type DigiSession = { ownerId: DigiOwnerId; sessionId: string; subject?: string };
 
 /** Consumes Digi RP session resolution. DDI does not read Digi tables. */
 export type DigiSessionClient = { resolve(token: string): Promise<DigiSession | null> };
@@ -14,9 +14,9 @@ export class HttpDigiSessionClient implements DigiSessionClient {
     try { response = await fetch(new URL("/me", this.baseUrl), { headers: { authorization: `Bearer ${token}` } }); }
     catch { return null; }
     if (!response.ok) return null;
-    const body = await response.json() as { ownerId?: string; sessionId?: string };
+    const body = await response.json() as { ownerId?: string; sessionId?: string; subject?: string };
     if (!body.ownerId || !body.sessionId) return null;
-    return { ownerId: body.ownerId as DigiOwnerId, sessionId: body.sessionId };
+    return { ownerId: body.ownerId as DigiOwnerId, sessionId: body.sessionId, subject: typeof body.subject === "string" ? body.subject : undefined };
   }
 }
 
@@ -124,5 +124,5 @@ async function readJson<T>(response: Response): Promise<T> {
 }
 
 export function defaultAuthorityVerifierUrl() {
-  return pathToFileURL("C:/Users/Hp/Desktop/TRUST ID/packages/authority-verifier/dist/index.js").href;
+  return pathToFileURL(join(process.env.DDI_TRUSTID_ROOT ?? "C:/Users/Hp/Desktop/TRUST ID", "packages", "authority-verifier", "dist", "index.js")).href;
 }

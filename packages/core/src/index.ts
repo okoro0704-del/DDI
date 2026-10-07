@@ -17,16 +17,40 @@ export class InMemoryDdiStore {
   audits: AuditRecord[] = [];
 }
 
-/** ElfCom mailbox key derived from the Digi owner. Applications cannot choose it. */
-export function elfcomAccountRef(ownerId: string) {
-  return `elfcom:${ownerId}`;
+const MAILBOX_PREFIX = "SYSTEM_MANAGED:ownerTrustId:";
+const OWNER_MARKER = ":digiOwner:";
+
+/** A TrustID subject is the ElfCom mailbox key. A Digi owner id is not. */
+export function isCanonicalMailboxSubject(ownerTrustId: string | undefined, ownerId: string): ownerTrustId is string {
+  if (!ownerTrustId) return false;
+  if (ownerTrustId === ownerId) return false;
+  if (ownerTrustId.startsWith("elfcom:")) return false;
+  if (ownerTrustId.startsWith("SYSTEM_MANAGED")) return false;
+  if (ownerTrustId.includes(OWNER_MARKER)) return false;
+  return !/\s/.test(ownerTrustId);
 }
 
-export function communicationBindingReference(ownerId: string) {
-  return `SYSTEM_MANAGED:${elfcomAccountRef(ownerId)}`;
+/** Binding record. The mailbox key is the TrustID subject. The Digi owner is only the binding constraint. */
+export function communicationBindingReference(ownerTrustId: string, ownerId: string) {
+  if (!isCanonicalMailboxSubject(ownerTrustId, ownerId)) throw new Error("MAILBOX_UNMAPPED");
+  return `${MAILBOX_PREFIX}${encodeURIComponent(ownerTrustId)}${OWNER_MARKER}${ownerId}`;
 }
 
-/** ElfCom remains the communication primitive. The Digi ownerId is the only account key. */
+export function parseCommunicationBinding(reference: string | undefined, ownerId: string): { status: "OK"; ownerTrustId: string } | { status: "OWNER_MISMATCH" } | { status: "UNMAPPED" } {
+  if (!reference?.startsWith(MAILBOX_PREFIX)) return { status: "UNMAPPED" };
+  const rest = reference.slice(MAILBOX_PREFIX.length);
+  const at = rest.lastIndexOf(OWNER_MARKER);
+  if (at < 0) return { status: "UNMAPPED" };
+  let ownerTrustId: string;
+  try { ownerTrustId = decodeURIComponent(rest.slice(0, at)); }
+  catch { return { status: "UNMAPPED" }; }
+  const boundOwner = rest.slice(at + OWNER_MARKER.length);
+  if (!isCanonicalMailboxSubject(ownerTrustId, boundOwner)) return { status: "UNMAPPED" };
+  if (boundOwner !== ownerId) return { status: "OWNER_MISMATCH" };
+  return { status: "OK", ownerTrustId };
+}
+
+/** ElfCom inbox is read with the TrustID subject stored on the binding. Digi ownerId is not a mailbox. */
 export class ElfComAdapter implements PrimitiveAdapter {
   namespace = "communication" as const;
   provider = "ElfCom" as const;
@@ -44,19 +68,23 @@ export class ElfComAdapter implements PrimitiveAdapter {
     return { ok: true as const };
   }
   async execute(request: CapabilityRequest): Promise<CapabilityResult> {
+    if (request.capability === "communication.inbox") return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: "PROVIDER_NOT_CONFIGURED" };
+    return { status: "FAILED", correlationId: request.correlationId, provider: this.provider, reason: "INVALID_REQUEST" };
+  }
+  async executeInbox(request: CapabilityRequest, ownerTrustId: string): Promise<CapabilityResult> {
     const ownerId = request.actor?.ownerId;
     if (!ownerId) return { status: "AUTHENTICATION_REQUIRED", correlationId: request.correlationId, provider: this.provider, reason: "VERIFIED_ACTOR_REQUIRED" };
     if (request.capability !== "communication.inbox") return { status: "FAILED", correlationId: request.correlationId, provider: this.provider, reason: "INVALID_REQUEST" };
-    const accountRef = elfcomAccountRef(ownerId);
+    if (!isCanonicalMailboxSubject(ownerTrustId, ownerId) || !this.baseUrl || !this.serviceToken) return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: !this.baseUrl || !this.serviceToken ? "PROVIDER_UNAVAILABLE" : "PROVIDER_NOT_CONFIGURED" };
     try {
-      const response = await this.fetchImpl(new URL(`/v1/pdi/inbox?ownerRef=${encodeURIComponent(accountRef)}`, this.baseUrl), {
+      const response = await this.fetchImpl(new URL(`/v1/pdi/inbox?ownerTrustId=${encodeURIComponent(ownerTrustId)}`, this.baseUrl), {
         headers: { authorization: `Bearer ${this.serviceToken}` },
         signal: AbortSignal.timeout(4000),
       });
       if (!response.ok) return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: "PROVIDER_UNAVAILABLE" };
-      const body = await response.json() as { ownerRef?: string; threads?: Array<{ id: string; channel: string; peerRef?: string; unreadCount?: number }> };
-      if (body.ownerRef !== accountRef || !Array.isArray(body.threads)) return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: "PROVIDER_UNAVAILABLE" };
-      return { status: "COMPLETED", correlationId: request.correlationId, provider: this.provider, data: { ownerId, accountRef, threads: body.threads.map(thread => ({ id: thread.id, channel: thread.channel, peerRef: thread.peerRef, unreadCount: thread.unreadCount ?? 0 })) } };
+      const body = await response.json() as { ownerTrustId?: string; threads?: Array<{ id: string; channel: string; peerRef?: string; unreadCount?: number }> };
+      if (body.ownerTrustId !== ownerTrustId || !Array.isArray(body.threads)) return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: "PROVIDER_UNAVAILABLE" };
+      return { status: "COMPLETED", correlationId: request.correlationId, provider: this.provider, data: { ownerId, threads: body.threads.map(thread => ({ id: thread.id, channel: thread.channel, peerRef: thread.peerRef, unreadCount: thread.unreadCount ?? 0 })) } };
     } catch {
       return { status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: this.provider, reason: "PROVIDER_UNAVAILABLE" };
     }
@@ -175,9 +203,12 @@ export async function executeCapability(input: {
   try {
     const resolved = await adapter.resolve(binding);
     if (!resolved.ok) return finish({ status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: binding.provider, reason: resolved.reason });
-    if (binding.namespace === "communication" && binding.provider === "ElfCom" && binding.configured) {
-      const expected = communicationBindingReference(request.actor.ownerId);
-      if (binding.reference !== expected) return finish({ status: "DENIED", correlationId: request.correlationId, provider: binding.provider, reason: binding.reference?.startsWith("SYSTEM_MANAGED:elfcom:") ? "OWNER_MISMATCH" : "PROVIDER_NOT_CONFIGURED" });
+    if (binding.namespace === "communication" && binding.provider === "ElfCom" && binding.configured && request.capability === "communication.inbox") {
+      const mailbox = parseCommunicationBinding(binding.reference, request.actor.ownerId);
+      if (mailbox.status === "OWNER_MISMATCH") return finish({ status: "DENIED", correlationId: request.correlationId, provider: binding.provider, reason: "OWNER_MISMATCH" });
+      if (mailbox.status !== "OK") return finish({ status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: binding.provider, reason: "PROVIDER_NOT_CONFIGURED" });
+      if (!(adapter instanceof ElfComAdapter)) return finish({ status: "CAPABILITY_UNAVAILABLE", correlationId: request.correlationId, provider: binding.provider, reason: "PROVIDER_MISMATCH" });
+      return finish(await adapter.executeInbox(request, mailbox.ownerTrustId), decision.grantId);
     }
     return finish(await adapter.execute(request), decision.grantId);
   } catch {
@@ -194,13 +225,13 @@ export class DdiService {
     if (!owner.verified || !owner.ownerId) throw new Error("AUTHENTICATED_OWNER_REQUIRED");
     if (type === "PERSONAL") {
       const existing = [...this.store.infrastructures.values()].find(item => item.ownerId === owner.ownerId && item.type === "PERSONAL");
-      if (existing) { this.ensurePersonalIdentity(existing.id); this.ensurePersonalCommunication(existing.id); return existing; }
+      if (existing) { this.ensurePersonalIdentity(existing.id); this.ensurePersonalCommunication(existing.id, owner.subject); return existing; }
     }
     const createdAt = now();
     const record: InfrastructureRecord = { id: id<InfrastructureId>("infra"), ownerId: owner.ownerId, type, status: "ACTIVE", applicationIds: [], primitiveBindingIds: [], relationshipIds: [], createdAt, updatedAt: createdAt, metadata };
     this.store.infrastructures.set(record.id, record);
     this.relationship(record.id, owner.ownerId, "OWNER");
-    if (type === "PERSONAL") { this.ensurePersonalIdentity(record.id); this.ensurePersonalCommunication(record.id); }
+    if (type === "PERSONAL") { this.ensurePersonalIdentity(record.id); this.ensurePersonalCommunication(record.id, owner.subject); }
     return record;
   }
   registerApplication(input: Omit<ApplicationRecord, "id" | "createdAt" | "updatedAt" | "grantedCapabilities"> & { grantedCapabilities?: Capability[] }): ApplicationRecord {
@@ -349,16 +380,28 @@ export class DdiService {
     if (existing) { if (existing.provider !== "TrustID") throw new Error("PROVIDER_CONFLICT"); return; }
     this.bind(infrastructureId, "identity", "TrustID", true, "SYSTEM_MANAGED");
   }
-  private ensurePersonalCommunication(infrastructureId: InfrastructureId) {
+  private ensurePersonalCommunication(infrastructureId: InfrastructureId, ownerTrustId?: string) {
     const infra = this.store.infrastructures.get(infrastructureId);
     if (!infra || infra.type !== "PERSONAL" || !infra.ownerId) return;
+    const subject = isCanonicalMailboxSubject(ownerTrustId, infra.ownerId) ? ownerTrustId : undefined;
     const existing = [...this.store.bindings.values()].find(item => item.infrastructureId === infrastructureId && item.namespace === "communication");
-    if (existing) { if (existing.provider !== "ElfCom") throw new Error("PROVIDER_CONFLICT"); return; }
-    this.bind(infrastructureId, "communication", "ElfCom", true, communicationBindingReference(infra.ownerId));
+    if (existing) {
+      if (existing.provider !== "ElfCom") throw new Error("PROVIDER_CONFLICT");
+      if (!subject) return;
+      const current = parseCommunicationBinding(existing.reference, infra.ownerId);
+      if (current.status === "OK" && current.ownerTrustId === subject) return;
+      if (current.status === "OK") throw new Error("PROVIDER_CONFLICT");
+      existing.reference = communicationBindingReference(subject, infra.ownerId);
+      existing.configured = true;
+      existing.management = "SYSTEM_MANAGED";
+      return;
+    }
+    if (!subject) return;
+    this.bind(infrastructureId, "communication", "ElfCom", true, communicationBindingReference(subject, infra.ownerId));
   }
   async route(request: CapabilityRequest): Promise<CapabilityResult> {
     if (request.capability.startsWith("identity.")) this.ensurePersonalIdentity(request.infrastructureId);
-    if (request.capability.startsWith("communication.")) this.ensurePersonalCommunication(request.infrastructureId);
+    if (request.capability.startsWith("communication.")) this.ensurePersonalCommunication(request.infrastructureId, request.actor?.subject);
     const infra = this.store.infrastructures.get(request.infrastructureId) ?? null;
     const app = this.store.applications.get(request.applicationId) ?? null;
     const namespace = request.capability.split(".")[0] as PrimitiveBinding["namespace"];

@@ -20,7 +20,7 @@ const DIGI_SCHEMA = "digi_reusable_v1";
 const AUTHORITY_SCHEMA = "authority_reusable_v1";
 const ISSUER = "https://trustedid.netlify.app/api";
 const AUDIENCE = "digiconomy:digi";
-const trustRoot = "C:/Users/Hp/Desktop/TRUST ID";
+const trustRoot = process.env.DDI_TRUSTID_ROOT ?? "C:/Users/Hp/Desktop/TRUST ID";
 
 type GrantView = { id: string; status: string; oneTime: boolean; actorType: string; actorId: string; actions: string[]; resources: string[]; audience: string };
 type Session = { ownerId: string; sessionToken: string; assertion: string };

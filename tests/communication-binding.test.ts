@@ -2,7 +2,7 @@ import test, { after, before, describe } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createSecretKey, randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { join } from "node:path"; import { pathToFileURL } from "node:url";
 import { Pool } from "pg";
 import { SignJWT } from "jose";
 import type { Actor, CapabilityRequest } from "../packages/contracts/src/index.ts";
@@ -14,7 +14,8 @@ import { DurableDdiService, defaultAdapters } from "../packages/service/src/runt
 
 const databaseUrl = process.env.DDI_TEST_DATABASE_URL ?? "";
 const SCHEMA = "ddi_communication_binding";
-const ELFCOM = "C:/Users/Hp/Desktop/ELFCOMS/apps/elfcom-node";
+const ELFCOM_ROOT = process.env.DDI_ELFCOM_ROOT ?? "C:/Users/Hp/Desktop/ELFCOMS";
+const ELFCOM = join(ELFCOM_ROOT, "apps", "elfcom-node");
 const PORT = 18792;
 const SERVICE_TOKEN = "ddi-communication-proof-token";
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -36,7 +37,7 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     assertLocal(databaseUrl);
     const env: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: "development", ELFCOM_PORT: String(PORT), ELFCOM_PDI_SERVICE_TOKEN: SERVICE_TOKEN };
     delete env.DATABASE_URL;
-    elfcom = spawn(process.execPath, ["C:/Users/Hp/Desktop/ELFCOMS/node_modules/tsx/dist/cli.mjs", "src/index.ts"], { cwd: ELFCOM, env, stdio: ["ignore", "pipe", "pipe"] });
+    elfcom = spawn(process.execPath, [join(ELFCOM_ROOT, "node_modules", "tsx", "dist", "cli.mjs"), "src/index.ts"], { cwd: ELFCOM, env, stdio: ["ignore", "pipe", "pipe"] });
     let log = "";
     elfcom.stdout?.on("data", (chunk) => { log += String(chunk); });
     elfcom.stderr?.on("data", (chunk) => { log += String(chunk); });
@@ -60,7 +61,7 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
   });
 
   after(async () => {
-    if (elfcom?.pid) spawn("taskkill", ["/PID", String(elfcom.pid), "/T", "/F"], { shell: true, stdio: "ignore" });
+    if (elfcom && !elfcom.killed) elfcom.kill("SIGTERM");
     await pool?.end();
   });
 
@@ -70,11 +71,11 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
   function actor(ownerId: string): Actor {
     return { ownerId: ownerId as Actor["ownerId"], kind: "HUMAN", verified: true };
   }
-  async function ready(ownerId: string, key: string, capabilities: CapabilityRequest["capability"][] = ["identity.currentActor", "communication.inbox"]) {
+  async function ready(ownerId: string, key: string, capabilities: CapabilityRequest["capability"][] = ["identity.currentActor", "communication.inbox"], ownerTrustId = `TID-${ownerId}`) {
     const current = actor(ownerId);
-    const infra = await repository.provision(current.ownerId, { type: "PERSONAL", idempotencyKey: key });
+    const infra = await repository.provision(current.ownerId, { type: "PERSONAL", idempotencyKey: key, ownerTrustId });
     const app = await repository.registerApplication(current.ownerId, infra.id, { type: "REFERENCE", displayName: "HospitalityOS", capabilities, idempotencyKey: `${key}-app` });
-    return { current, infra, app };
+    return { current, infra, app, ownerTrustId };
   }
   function request(item: { infra: { id: string; ownerId: Actor["ownerId"] }; app: { id: string } }, mode: "APP" | "SPACE", capability: CapabilityRequest["capability"], payload?: unknown): CapabilityRequest {
     return { infrastructureId: item.infra.id as CapabilityRequest["infrastructureId"], applicationId: item.app.id as CapabilityRequest["applicationId"], capability, action: capability, resource: `ddi:pdi:${item.infra.id}:${capability}`, audience: "ddi", actor: { ownerId: item.infra.ownerId, kind: "SERVICE", verified: true, authorityActor: `app:${item.app.id}` }, authority: { token: "authority-token" }, correlationId: randomUUID(), executionMode: mode, payload };
@@ -90,8 +91,14 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     const rows = await pool.query<{ n: string; provider: string; provider_reference: string }>(`SELECT count(*)::text AS n, max(provider) AS provider, max(provider_reference) AS provider_reference FROM ddi_primitive_bindings WHERE infrastructure_id = $1 AND namespace = 'communication'`, [item.infra.id]);
     assert.equal(Number(rows.rows[0]?.n), 1);
     assert.equal(rows.rows[0]?.provider, "ElfCom");
-    assert.equal(rows.rows[0]?.provider_reference, communicationBindingReference("own_comm_new"));
-    assert.equal((await repository.findBinding(item.infra.id, "communication"))?.management, "SYSTEM_MANAGED");
+    assert.equal(rows.rows[0]?.provider_reference, communicationBindingReference("TID-own_comm_new", "own_comm_new"));
+    const bindingId = (await repository.findBinding(item.infra.id, "communication"))?.id;
+    await pool.query(`UPDATE ddi_primitive_bindings SET provider_reference = $2 WHERE infrastructure_id = $1 AND namespace = 'communication'`, [item.infra.id, `SYSTEM_MANAGED:elfcom:${item.current.ownerId}`]);
+    await repository.ensurePersonalCommunication(item.infra.id, "TID-own_comm_new");
+    const repaired = await repository.findBinding(item.infra.id, "communication");
+    assert.equal(repaired?.id, bindingId);
+    assert.equal(repaired?.reference, communicationBindingReference("TID-own_comm_new", "own_comm_new"));
+    assert.equal(repaired?.management, "SYSTEM_MANAGED");
     assert.equal((await repository.listConnections(item.infra.id)).length, 0);
     const again = await repository.provision(item.current.ownerId, { type: "PERSONAL", idempotencyKey: "comm-new-repeat" });
     assert.equal(again.id, item.infra.id);
@@ -100,10 +107,18 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     await assert.rejects(repository.bind(item.current.ownerId, item.infra.id, "communication", "TrustID"), /PROVIDER_LOCKED|PROVIDER_CONFLICT/);
     const creator = await repository.provision(item.current.ownerId, { type: "CREATOR", idempotencyKey: "creator-no-communication" });
     assert.equal(await repository.findBinding(creator.id, "communication"), null);
+    const unmapped = await repository.provision(actor("own_comm_unmapped").ownerId, { type: "PERSONAL", idempotencyKey: "comm-unmapped" });
+    assert.equal(await repository.findBinding(unmapped.id, "communication"), null);
+    assert.equal((await repository.findBinding(unmapped.id, "identity"))?.provider, "TrustID");
   });
 
-  test("inbox follows connection state and stays bound to the same ElfCom account", async () => {
-    const item = await ready("own_comm_exec", "comm-exec", ["identity.currentActor", "communication.inbox", "communication.send"]);
+  test("a conversation opened before the PDI binding is visible, and products share that mailbox", async () => {
+    const subject = "TID-own_comm_exec";
+    const opened = await fetch(new URL("/v1/dm/open", BASE), { method: "POST", headers: { authorization: `Bearer ${await elfcomSession(subject)}`, "content-type": "application/json" }, body: JSON.stringify({ peerTrustId: "TID-own_comm_peer" }) });
+    const openedBody = await opened.text();
+    assert.equal(opened.status, 200, openedBody);
+    const threadId = (JSON.parse(openedBody) as { thread: { id: string } }).thread.id;
+    const item = await ready("own_comm_exec", "comm-exec", ["identity.currentActor", "communication.inbox", "communication.send"], subject);
     const runtime = service();
     const absent = await runtime.execute(request(item, "APP", "communication.inbox"));
     assert.equal(absent.status, "DENIED");
@@ -120,22 +135,26 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     const still = await runtime.execute(request(item, "APP", "communication.inbox"));
     assert.equal(still.reason, "CAPABILITY_NOT_APPROVED");
     await repository.approveConnection(item.current.ownerId, pending.id, ["communication.inbox"], "comm-approve", grants);
-    const account = `elfcom:${item.current.ownerId}`;
-    const opened = await fetch(new URL("/v1/dm/open", BASE), { method: "POST", headers: { authorization: `Bearer ${await elfcomSession(account)}`, "content-type": "application/json" }, body: JSON.stringify({ peerTrustId: "elfcom:own_comm_peer" }) });
-    const openedBody = await opened.text();
-    assert.equal(opened.status, 200, openedBody);
-    const threadId = (JSON.parse(openedBody) as { thread: { id: string } }).thread.id;
-    const completed = await runtime.execute(request(item, "APP", "communication.inbox", { accountRef: "elfcom:own_other", provider: "ElfCom" }));
+    const completed = await runtime.execute(request(item, "APP", "communication.inbox", { accountRef: "elfcom:own_other", ownerTrustId: "TID-someone-else", provider: "ElfCom" }));
     assert.equal(completed.status, "COMPLETED");
     assert.equal(completed.provider, "ElfCom");
-    const data = completed.data as { ownerId: string; accountRef: string; threads: Array<{ id: string }> };
+    const data = completed.data as { ownerId: string; accountRef?: string; ownerTrustId?: string; threads: Array<{ id: string }> };
     assert.equal(data.ownerId, item.current.ownerId);
-    assert.equal(data.accountRef, account);
+    assert.equal(data.accountRef, undefined);
+    assert.equal(data.ownerTrustId, undefined);
+    assert.equal(JSON.stringify(data).includes("elfcom:"), false);
     assert.equal(data.threads.some(thread => thread.id === threadId), true);
     const space = await runtime.execute(request(item, "SPACE", "communication.inbox"));
-    assert.equal((space.data as { accountRef: string; ownerId: string }).ownerId, item.current.ownerId);
-    assert.equal((space.data as { accountRef: string }).accountRef, account);
+    assert.equal((space.data as { ownerId: string }).ownerId, item.current.ownerId);
+    assert.equal((space.data as { threads: Array<{ id: string }> }).threads.some(thread => thread.id === threadId), true);
     const bindingId = (await repository.findBinding(item.infra.id, "communication"))?.id;
+    const lifeos = await repository.registerApplication(item.current.ownerId, item.infra.id, { type: "REFERENCE", displayName: "LifeOS", capabilities: ["communication.inbox"], idempotencyKey: "comm-exec-lifeos" });
+    const lifeosConnection = await repository.requestConnection(lifeos.id, ["communication.inbox"], "lifeos", "comm-exec-lifeos-connection");
+    await repository.approveConnection(item.current.ownerId, lifeosConnection.id, ["communication.inbox"], "lifeos-approve", grants);
+    const shared = await runtime.execute(request({ infra: item.infra, app: lifeos }, "APP", "communication.inbox"));
+    assert.equal(shared.status, "COMPLETED");
+    assert.equal((shared.data as { threads: Array<{ id: string }> }).threads.some(thread => thread.id === threadId), true);
+    assert.equal((await repository.findBinding(item.infra.id, "communication"))?.id, bindingId);
     await repository.revokeConnection(item.current.ownerId, pending.id, "revoke", grants);
     const revoked = await runtime.execute(request(item, "APP", "communication.inbox"));
     assert.equal(revoked.reason, "CONNECTION_NOT_ACTIVE");
@@ -144,7 +163,7 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     await repository.approveConnection(item.current.ownerId, reconnected.id, ["communication.inbox"], "reapprove", grants);
     const restored = await runtime.execute(request(item, "SPACE", "communication.inbox"));
     assert.equal(restored.status, "COMPLETED");
-    assert.equal((restored.data as { accountRef: string }).accountRef, account);
+    assert.equal((restored.data as { threads: Array<{ id: string }> }).threads.some(thread => thread.id === threadId), true);
     assert.equal((await repository.findBinding(item.infra.id, "communication"))?.id, bindingId);
     const sendPending = await repository.requestCapabilityChange(item.app.id, ["communication.send"], "comm-send");
     await repository.approveConnection(item.current.ownerId, sendPending.id, ["communication.send"], "comm-send-approve", grants);
@@ -178,32 +197,42 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     const right = await ready("own_comm_b", "comm-b");
     const runtime = service();
     for (const item of [left, right]) await activate(item, ["communication.inbox"], item.infra.id);
-    await fetch(new URL("/v1/dm/open", BASE), { method: "POST", headers: { authorization: `Bearer ${await elfcomSession(`elfcom:${left.current.ownerId}`)}`, "content-type": "application/json" }, body: JSON.stringify({ peerTrustId: "elfcom:peer-left" }) });
+    const opened = await fetch(new URL("/v1/dm/open", BASE), { method: "POST", headers: { authorization: `Bearer ${await elfcomSession(left.ownerTrustId)}`, "content-type": "application/json" }, body: JSON.stringify({ peerTrustId: "TID-peer-left" }) });
+    const openedBody = await opened.text();
+    assert.equal(opened.status, 200, openedBody);
+    const threadId = (JSON.parse(openedBody) as { thread: { id: string } }).thread.id;
     const leftResult = await runtime.execute(request(left, "APP", "communication.inbox"));
     const rightResult = await runtime.execute(request(right, "APP", "communication.inbox"));
     assert.equal((leftResult.data as { ownerId: string }).ownerId, "own_comm_a");
     assert.equal((rightResult.data as { ownerId: string }).ownerId, "own_comm_b");
-    assert.equal((leftResult.data as { threads: unknown[] }).threads.length > 0, true);
-    assert.equal((rightResult.data as { threads: unknown[] }).threads.length, 0);
+    assert.equal((leftResult.data as { threads: Array<{ id: string }> }).threads.some(thread => thread.id === threadId), true);
+    assert.equal((rightResult.data as { threads: Array<{ id: string }> }).threads.some(thread => thread.id === threadId), false);
     const crossed = await runtime.execute({ ...request(left, "APP", "communication.inbox"), actor: { ownerId: right.current.ownerId, kind: "SERVICE", verified: true } });
     assert.equal(crossed.reason, "OWNER_MISMATCH");
-    await pool.query(`UPDATE ddi_primitive_bindings SET provider_reference = $2 WHERE infrastructure_id = $1 AND namespace = 'communication'`, [left.infra.id, communicationBindingReference("own_comm_b")]);
+    await pool.query(`UPDATE ddi_primitive_bindings SET provider_reference = $2 WHERE infrastructure_id = $1 AND namespace = 'communication'`, [left.infra.id, communicationBindingReference(right.ownerTrustId, right.current.ownerId)]);
     const tampered = await runtime.execute(request(left, "APP", "communication.inbox"));
     assert.equal(tampered.status, "DENIED");
     assert.equal(tampered.reason, "OWNER_MISMATCH");
+    await pool.query(`UPDATE ddi_primitive_bindings SET provider_reference = $2 WHERE infrastructure_id = $1 AND namespace = 'communication'`, [left.infra.id, `SYSTEM_MANAGED:elfcom:${left.current.ownerId}`]);
+    const synthetic = await runtime.execute(request(left, "APP", "communication.inbox"));
+    assert.equal(synthetic.status, "CAPABILITY_UNAVAILABLE");
+    assert.equal(synthetic.reason, "PROVIDER_NOT_CONFIGURED");
     await pool.query(`UPDATE ddi_primitive_bindings SET provider_reference = NULL WHERE infrastructure_id = $1 AND namespace = 'communication'`, [right.infra.id]);
     const missing = await runtime.execute(request(right, "APP", "communication.inbox"));
     assert.equal(missing.reason, "PROVIDER_NOT_CONFIGURED");
-    const restartedPool = new Pool({ connectionString: databaseUrl, max: 2, connectionTimeoutMillis: 5000, options: `-c search_path=${SCHEMA}` });
+    const restartedPool = new Pool({ connectionString: databaseUrl, max: 2, connectionTimeoutMillis: 20000, options: `-c search_path=${SCHEMA}` });
     const restarted = new PostgresDdiRepository(restartedPool);
+    await pool.query(`UPDATE ddi_primitive_bindings SET provider_reference = $2 WHERE infrastructure_id = $1 AND namespace = 'communication'`, [left.infra.id, communicationBindingReference(left.ownerTrustId, left.current.ownerId)]);
     const binding = await restarted.findBinding(left.infra.id, "communication");
     assert.equal(binding?.provider, "ElfCom");
-    assert.equal(binding?.reference, communicationBindingReference("own_comm_b"));
-    await pool.query(`UPDATE ddi_primitive_bindings SET provider_reference = $2 WHERE infrastructure_id = $1 AND namespace = 'communication'`, [left.infra.id, communicationBindingReference("own_comm_a")]);
+    assert.equal(binding?.reference, communicationBindingReference(left.ownerTrustId, "own_comm_a"));
+    const again = await restarted.provision(left.current.ownerId, { type: "PERSONAL", idempotencyKey: "comm-a-return", ownerTrustId: left.ownerTrustId });
+    assert.equal(again.id, left.infra.id);
+    assert.equal((await restarted.findBinding(left.infra.id, "communication"))?.id, binding?.id);
     const restartedService = new DurableDdiService(restarted, allow, defaultAdapters(async () => null, { baseUrl: BASE, serviceToken: SERVICE_TOKEN }), undefined, grants);
     const afterRestart = await restartedService.execute(request(left, "SPACE", "communication.inbox"));
-    assert.equal((afterRestart.data as { ownerId: string; accountRef: string }).ownerId, "own_comm_a");
-    assert.equal((afterRestart.data as { accountRef: string }).accountRef, "elfcom:own_comm_a");
+    assert.equal((afterRestart.data as { ownerId: string }).ownerId, "own_comm_a");
+    assert.equal((afterRestart.data as { threads: Array<{ id: string }> }).threads.some(thread => thread.id === threadId), true);
     await restartedPool.end();
   });
 
@@ -225,7 +254,7 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
 async function elfcomSession(owner: string) {
   const secret = "elfcom-dev-node-secret-change-me";
   const sid = `proof:${owner}`;
-  const specifier = "file:///C:/Users/Hp/Desktop/ELFCOMS/packages/elfcom-crypto/dist/index.js";
+  const specifier = pathToFileURL(join(ELFCOM_ROOT, "packages", "elfcom-crypto", "dist", "index.js")).href;
   const crypto = await import(specifier) as { computeZkBind(key: Buffer, fields: { aud: string; sid: string; ownerTrustId: string }): string; derivePhaseASessionKey(secret: string, owner: string, sid: string): Buffer };
   const sessionKey = crypto.derivePhaseASessionKey(secret, owner, sid);
   const zk_bind = crypto.computeZkBind(sessionKey, { aud: "elfcom", sid, ownerTrustId: owner });

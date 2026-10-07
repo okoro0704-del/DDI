@@ -18,9 +18,10 @@ const SCHEMA = "ddi_accept";
 const DIGI_SCHEMA = "digi_ddi_owner_proof";
 const ISSUER = "https://trustedid.netlify.app/api";
 const AUDIENCE = "digiconomy:digi";
-const bridgeUrl = pathToFileURL("C:/Users/Hp/Desktop/TRUST ID/packages/digi-bridge/dist/index.js").href;
-const authorityUrl = pathToFileURL("C:/Users/Hp/Desktop/TRUST ID/packages/digi-authority/dist/index.js").href;
-const verifierUrl = pathToFileURL("C:/Users/Hp/Desktop/TRUST ID/packages/authority-verifier/dist/index.js").href;
+const trustRoot = process.env.DDI_TRUSTID_ROOT ?? "C:/Users/Hp/Desktop/TRUST ID";
+const bridgeUrl = pathToFileURL(join(trustRoot, "packages/digi-bridge/dist/index.js")).href;
+const authorityUrl = pathToFileURL(join(trustRoot, "packages/digi-authority/dist/index.js")).href;
+const verifierUrl = pathToFileURL(join(trustRoot, "packages/authority-verifier/dist/index.js")).href;
 
 function assertLocal(url: string) {
   const host = new URL(url).hostname;

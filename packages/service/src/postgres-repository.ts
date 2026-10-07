@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type { ApplicationRecord, AuditRecord, AuthorityGrantRef, Capability, ConnectionAuditRecord, DigiOwnerId, InfrastructureRecord, PdiApplicationConnection, PrimitiveBinding, Relationship } from "../../contracts/src/index.ts";
 import { assertCapabilitySubset, authorityBinding, sameCapabilities } from "../../core/src/connection.ts";
+import { communicationBindingReference, isCanonicalMailboxSubject, parseCommunicationBinding } from "../../core/src/index.ts";
 import type { PersistentState } from "./store.ts";
 import type { DdiRepository, ProvisionInput, RegisterAppInput } from "./repository.ts";
 
@@ -38,7 +39,7 @@ export class PostgresDdiRepository implements DdiRepository {
       if (!row) throw new Error("IDEMPOTENCY_MISSING");
       if (row.owner_id !== ownerId) throw new Error("IDEMPOTENCY_OWNER_MISMATCH");
       if (row.response?.id) {
-        if (input.type === "PERSONAL") { await this.ensureIdentityBinding(client, row.response.id); await this.ensureCommunicationBinding(client, row.response.id); }
+        if (input.type === "PERSONAL") { await this.ensureIdentityBinding(client, row.response.id); await this.ensureCommunicationBinding(client, row.response.id, input.ownerTrustId); }
         const existing = await this.hydrate(client, row.response.id);
         if (!existing) throw new Error("IDEMPOTENCY_MISSING");
         return existing;
@@ -47,7 +48,7 @@ export class PostgresDdiRepository implements DdiRepository {
         const canonical = await client.query<{ id: string }>(`SELECT id FROM ddi_infrastructures WHERE owner_id = $1 AND type = 'PERSONAL' FOR UPDATE`, [ownerId]);
         if (canonical.rows[0]) {
           await this.ensureIdentityBinding(client, canonical.rows[0].id);
-          await this.ensureCommunicationBinding(client, canonical.rows[0].id);
+          await this.ensureCommunicationBinding(client, canonical.rows[0].id, input.ownerTrustId);
           const existing = await this.hydrate(client, canonical.rows[0].id);
           if (!existing) throw new Error("UNKNOWN_INFRASTRUCTURE");
           await client.query(`UPDATE ddi_idempotency SET response = $2::jsonb WHERE key = $1`, [input.idempotencyKey, JSON.stringify(existing)]);
@@ -64,7 +65,7 @@ export class PostgresDdiRepository implements DdiRepository {
         if (code !== "23505" || input.type !== "PERSONAL") throw error;
         await client.query("ROLLBACK TO SAVEPOINT ddi_personal_insert");
         const canonical = await client.query<{ id: string }>(`SELECT id FROM ddi_infrastructures WHERE owner_id = $1 AND type = 'PERSONAL'`, [ownerId]);
-        if (canonical.rows[0]) { await this.ensureIdentityBinding(client, canonical.rows[0].id); await this.ensureCommunicationBinding(client, canonical.rows[0].id); }
+        if (canonical.rows[0]) { await this.ensureIdentityBinding(client, canonical.rows[0].id); await this.ensureCommunicationBinding(client, canonical.rows[0].id, input.ownerTrustId); }
         const existing = canonical.rows[0] ? await this.hydrate(client, canonical.rows[0].id) : null;
         if (!existing) throw error;
         await client.query(`UPDATE ddi_idempotency SET response = $2::jsonb WHERE key = $1`, [input.idempotencyKey, JSON.stringify(existing)]);
@@ -75,7 +76,7 @@ export class PostgresDdiRepository implements DdiRepository {
       infra.relationshipIds = [relation.id];
       if (infra.type === "PERSONAL") {
         const binding = await this.ensureIdentityBinding(client, infra.id);
-        const communication = await this.ensureCommunicationBinding(client, infra.id);
+        const communication = await this.ensureCommunicationBinding(client, infra.id, input.ownerTrustId);
         infra.primitiveBindingIds = [binding?.id, communication?.id].filter((item): item is NonNullable<typeof item> => item !== undefined);
       }
       await this.connectionEvent(client, { eventType: "PDI_CREATED", correlationId: input.idempotencyKey, ownerId, infrastructureId: infra.id, result: "CREATED", timestamp: at });
@@ -151,20 +152,29 @@ export class PostgresDdiRepository implements DdiRepository {
     return inserted.rows[0] ? mapBinding(inserted.rows[0]) : null;
   }
 
-  async ensurePersonalCommunication(infrastructureId: string) {
-    await this.transaction(async (client) => { await this.ensureCommunicationBinding(client, infrastructureId); });
+  async ensurePersonalCommunication(infrastructureId: string, ownerTrustId?: string) {
+    await this.transaction(async (client) => { await this.ensureCommunicationBinding(client, infrastructureId, ownerTrustId); });
   }
 
-  private async ensureCommunicationBinding(client: PoolClient, infrastructureId: string) {
+  private async ensureCommunicationBinding(client: PoolClient, infrastructureId: string, ownerTrustId?: string) {
     const infra = await client.query<{ owner_id: string | null; type: string }>(`SELECT owner_id, type FROM ddi_infrastructures WHERE id = $1 FOR UPDATE`, [infrastructureId]);
     const row = infra.rows[0];
     if (!row?.owner_id || row.type !== "PERSONAL") return null;
-    const reference = `SYSTEM_MANAGED:elfcom:${row.owner_id}`;
+    const subject = isCanonicalMailboxSubject(ownerTrustId, row.owner_id) ? ownerTrustId : undefined;
     const existing = await client.query<BindingRow>(`SELECT id, infrastructure_id, namespace, provider, configured, provider_reference FROM ddi_primitive_bindings WHERE infrastructure_id = $1 AND namespace = 'communication' FOR UPDATE`, [infrastructureId]);
     if (existing.rows[0]) {
       if (existing.rows[0].provider !== "ElfCom") throw new Error("PROVIDER_CONFLICT");
-      return mapBinding(existing.rows[0]);
+      if (!subject) return mapBinding(existing.rows[0]);
+      const current = parseCommunicationBinding(existing.rows[0].provider_reference ?? undefined, row.owner_id);
+      const next = communicationBindingReference(subject, row.owner_id);
+      if (current.status === "OK" && current.ownerTrustId === subject) return mapBinding(existing.rows[0]);
+      if (current.status === "OK") throw new Error("PROVIDER_CONFLICT");
+      const at = new Date().toISOString();
+      await client.query(`UPDATE ddi_primitive_bindings SET provider_reference = $2, configured = TRUE, updated_at = $3 WHERE id = $1`, [existing.rows[0].id, next, at]);
+      return mapBinding({ ...existing.rows[0], provider_reference: next, configured: true });
     }
+    if (!subject) return null;
+    const reference = communicationBindingReference(subject, row.owner_id);
     const at = new Date().toISOString();
     const inserted = await client.query<BindingRow>(`INSERT INTO ddi_primitive_bindings (id, infrastructure_id, namespace, provider, configured, provider_reference, created_at, updated_at) VALUES ($1,$2,'communication','ElfCom',TRUE,$3,$4,$4) RETURNING id, infrastructure_id, namespace, provider, configured, provider_reference`, [`binding:${randomUUID()}`, infrastructureId, reference, at]);
     const relationId = `relationship:${randomUUID()}`;
@@ -225,11 +235,11 @@ export class PostgresDdiRepository implements DdiRepository {
     return { infrastructures, applications, bindings: primitiveBindings, relationships, connections, connectionAudits, audits: audits.rows.map(row => ({ timestamp: iso(row.timestamp), correlationId: row.correlation_id, infrastructureId: row.infrastructure_id as AuditRecord["infrastructureId"], applicationId: row.application_id as AuditRecord["applicationId"], ownerId: (row.owner_id ?? undefined) as DigiOwnerId | undefined, actor: row.actor_subject ?? undefined, audience: row.audience, capability: row.capability as AuditRecord["capability"], action: row.action, resource: row.resource, provider: (row.provider ?? undefined) as AuditRecord["provider"], grantId: row.grant_id ?? undefined, connectionId: (row.connection_id ?? undefined) as AuditRecord["connectionId"], decision: row.decision, reason: row.reason ?? undefined, executionMode: row.execution_mode, result: row.result })), idempotency: {} };
   }
 
-  async findPersonal(ownerId: DigiOwnerId) {
+  async findPersonal(ownerId: DigiOwnerId, ownerTrustId?: string) {
     const result = await this.pool.query<{ id: string }>(`SELECT id FROM ddi_infrastructures WHERE owner_id = $1 AND type = 'PERSONAL'`, [ownerId]);
     if (!result.rows[0]) return null;
     await this.ensurePersonalIdentity(result.rows[0].id);
-    await this.ensurePersonalCommunication(result.rows[0].id);
+    await this.ensurePersonalCommunication(result.rows[0].id, ownerTrustId);
     return this.getInfrastructure(result.rows[0].id);
   }
   async findApplicationByCredential(secret: string) {

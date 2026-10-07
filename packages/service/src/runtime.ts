@@ -37,10 +37,10 @@ export class DurableDdiService {
   async authenticate(token: string): Promise<Actor | null> {
     const session = await this.sessions?.resolve(token);
     if (!session) return null;
-    return { ownerId: session.ownerId, kind: "HUMAN", verified: true };
+    return { ownerId: session.ownerId, subject: session.subject, kind: "HUMAN", verified: true };
   }
   authenticateApplication(secret: string) { return this.repository.findApplicationByCredential(secret); }
-  findPersonal(actor: Actor) { if (!actor.verified || !actor.ownerId) throw new Error("OWNER_REQUIRED"); return this.repository.findPersonal(actor.ownerId); }
+  findPersonal(actor: Actor) { if (!actor.verified || !actor.ownerId) throw new Error("OWNER_REQUIRED"); return this.repository.findPersonal(actor.ownerId, actor.subject); }
   requestConnection(applicationId: string, capabilities: Capability[], correlationId: string, idempotencyKey: string) { return this.repository.requestConnection(applicationId, capabilities, correlationId, idempotencyKey); }
   requestCapabilityChange(applicationId: string, capabilities: Capability[], correlationId: string) { return this.repository.requestCapabilityChange(applicationId, capabilities, correlationId); }
   approveConnection(actor: Actor, connectionId: string, capabilities: Capability[], correlationId: string, sessionToken?: string) {
@@ -62,7 +62,10 @@ export class DurableDdiService {
   listConnections(infrastructureId: string) { return this.repository.listConnections(infrastructureId); }
   provision(actor: Actor, input: { type: InfrastructureType; metadata?: Record<string, string>; idempotencyKey: string }) {
     if (!actor.verified || !actor.ownerId || !input.idempotencyKey) throw new Error("AUTHENTICATED_ACTOR_AND_IDEMPOTENCY_REQUIRED");
-    return this.repository.provision(actor.ownerId, input);
+    const metadata = { ...(input.metadata ?? {}) };
+    delete metadata.ownerTrustId;
+    delete metadata.accountRef;
+    return this.repository.provision(actor.ownerId, { type: input.type, metadata, idempotencyKey: input.idempotencyKey, ownerTrustId: actor.subject });
   }
   registerApp(actor: Actor, infrastructureId: string, input: { type: string; displayName: string; publicUrl?: string; adminUrl?: string; capabilities: Capability[]; idempotencyKey: string }) {
     if (!actor.verified || !actor.ownerId) throw new Error("OWNER_REQUIRED");

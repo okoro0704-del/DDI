@@ -7,13 +7,13 @@ export type AuthorityGrantPort = {
 };
 export type RegisteredApplication = ApplicationRecord & { applicationCredential?: string };
 
-export type ProvisionInput = { type: InfrastructureType; metadata?: Record<string, string>; idempotencyKey: string };
+export type ProvisionInput = { type: InfrastructureType; metadata?: Record<string, string>; idempotencyKey: string; ownerTrustId?: string };
 export type RegisterAppInput = { type: string; displayName: string; publicUrl?: string; adminUrl?: string; capabilities: Capability[]; idempotencyKey: string };
 
 export interface DdiRepository {
   provision(ownerId: InfrastructureRecord["ownerId"], input: ProvisionInput): Promise<InfrastructureRecord>;
   registerApplication(ownerId: InfrastructureRecord["ownerId"], infrastructureId: string, input: RegisterAppInput): Promise<RegisteredApplication>;
-  findPersonal(ownerId: InfrastructureRecord["ownerId"]): Promise<InfrastructureRecord | null>;
+  findPersonal(ownerId: InfrastructureRecord["ownerId"], ownerTrustId?: string): Promise<InfrastructureRecord | null>;
   findApplicationByCredential(secret: string): Promise<ApplicationRecord | null>;
   requestConnection(applicationId: string, capabilities: Capability[], correlationId: string, idempotencyKey: string): Promise<PdiApplicationConnection>;
   requestCapabilityChange(applicationId: string, capabilities: Capability[], correlationId: string): Promise<PdiApplicationConnection>;
@@ -28,7 +28,7 @@ export interface DdiRepository {
   getInfrastructure(id: string): Promise<InfrastructureRecord | null>;
   getApplication(id: string): Promise<ApplicationRecord | null>;
   ensurePersonalIdentity(infrastructureId: string): Promise<void>;
-  ensurePersonalCommunication(infrastructureId: string): Promise<void>;
+  ensurePersonalCommunication(infrastructureId: string, ownerTrustId?: string): Promise<void>;
   findBinding(infrastructureId: string, namespace: PrimitiveBinding["namespace"]): Promise<PrimitiveBinding | null>;
   insertAudit(audit: AuditRecord): Promise<void>;
   snapshot(): Promise<PersistentState>;
