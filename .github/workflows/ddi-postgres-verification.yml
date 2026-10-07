@@ -55,7 +55,7 @@ jobs:
         run: npm ci && npm run build:security
       - name: Install and build ElfCom contracts
         working-directory: elfcom
-        run: npm ci && npm run build -w @elfcom/crypto
+        run: npm ci && npm run build -w @elfcom/contract && npm run build -w @elfcom/crypto
       - name: Typecheck DDI
         run: npm run typecheck
       - name: Verify localhost safety gate
