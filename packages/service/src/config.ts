@@ -64,7 +64,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DdiConfig {
     portalProvisioningUrl: env.PORTAL_PROVISIONING_URL,
   };
   if (production) {
-    if (!config.databaseUrl || !config.trustIdIssuer || !config.trustIdAudience || !config.trustIdJwksUrl || !config.trustIdBridgeModuleUrl || !allowedOrigins.length || !config.digiCoreUrl || !config.digiAuthorityUrl || !config.digiAuthorityJwksUrl || !config.digiAuthorityVerifierModuleUrl || !config.portalOwnershipUrl || !config.portalOwnershipSharedSecret) invalid();
+    // D3C-C: DDI authenticates to the Portal with its own service identity; the D3A shared secret is not accepted in production.
+    if (!config.databaseUrl || !config.trustIdIssuer || !config.trustIdAudience || !config.trustIdJwksUrl || !config.trustIdBridgeModuleUrl || !allowedOrigins.length || !config.digiCoreUrl || !config.digiAuthorityUrl || !config.digiAuthorityJwksUrl || !config.digiAuthorityVerifierModuleUrl || !config.portalOwnershipUrl || !config.serviceSigner) invalid();
     if ((env.DDI_COMMERCIAL_CATALOG || env.DDI_COMMERCIAL_CATALOG_PATH) && (config.activationCodePepper ?? "").length < 32) invalid();
     // Production provisioning stays fail-closed: the local-integration adapter is never enabled there.
     if (config.provisioningMode) invalid();

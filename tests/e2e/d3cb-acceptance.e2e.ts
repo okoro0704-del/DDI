@@ -170,7 +170,7 @@ describe("D3C-B acceptance: DDI x Portal x Master Distributor (real local servic
     await bootstrap.query(`CREATE SCHEMA ${SCHEMA}`);
     await bootstrap.end();
     pool = new Pool({ connectionString: ddiDb, max: 16, options: `-c search_path=${SCHEMA}` });
-    for (const m of ["001_ddi_foundation", "002_ddi_runtime", "003_pdi_connections", "004_connected_properties", "005_commercial_activation", "006_commercial_recovery", "007_portal_install_state", "008_download_grant_version"]) await migrate(pool, join(import.meta.dirname, "../../migrations", `${m}.sql`));
+    for (const m of ["001_ddi_foundation", "002_ddi_runtime", "003_pdi_connections", "004_connected_properties", "005_commercial_activation", "006_commercial_recovery", "007_portal_install_state", "008_download_grant_version", "009_service_token_replay"]) await migrate(pool, join(import.meta.dirname, "../../migrations", `${m}.sql`));
     ddi = new PostgresDdiRepository(pool);
     commercialRepo = new PostgresCommercialRepository(pool);
     installState = new PostgresPortalInstallState(pool);

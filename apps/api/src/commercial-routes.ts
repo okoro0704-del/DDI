@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { Actor, ApplicationRecord, InfrastructureRecord } from "../../../packages/contracts/src/index.ts";
 import type { CommercialService } from "../../../packages/service/src/commercial.ts";
 import type { LifecycleAction } from "../../../packages/service/src/commercial-repository.ts";
-import { bearer, type ServiceTokenVerifier } from "../../../packages/service/src/service-token.ts";
+import { bearer, ServiceReplayUnavailable, type ServiceTokenVerifier } from "../../../packages/service/src/service-token.ts";
 
 export type CommercialApi = Pick<CommercialService, "issueCode" | "revokeCode" | "getCode" | "redeem" | "getRedemption" | "listEntitlements" | "listLicenses" | "getLicense" | "verifyLicense" | "changeLicense" | "changeEntitlement" | "authorizeDownload" | "redeemDownload" | "runOutboxAsOperator" | "getRedemptionDetail" | "requeueRedemption">;
 
@@ -129,7 +129,9 @@ export function registerCommercialRoutes(app: FastifyInstance, deps: {
 
   app.post("/internal/downloads/redeem", async (request, reply) => {
     if (!deps.commercial || !deps.serviceAuth) return reply.code(503).send({ code: "COMMERCIAL_UNAVAILABLE" });
-    const caller = deps.serviceAuth.verify(bearer(request.headers.authorization), { method: "POST", path: "/internal/downloads/redeem" });
+    let caller;
+    try { caller = await deps.serviceAuth.verify(bearer(request.headers.authorization), { method: "POST", path: "/internal/downloads/redeem" }); }
+    catch (error) { if (error instanceof ServiceReplayUnavailable) return reply.code(503).send({ code: error.message }); throw error; }
     if (!caller) return reply.code(401).send({ code: "SERVICE_AUTHENTICATION_REQUIRED" });
     if (!caller.permissions.includes("downloads:redeem")) return reply.code(403).send({ code: "FORBIDDEN" });
     const body = request.body as { token?: unknown; artifactId?: unknown; productId?: unknown; propertyId?: unknown; version?: unknown } | undefined;

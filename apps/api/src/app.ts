@@ -6,7 +6,7 @@ import type { DdiConfig } from "../../../packages/service/src/config.ts";
 import { commercialRouteInventory, registerCommercialRoutes, type CommercialApi } from "./commercial-routes.ts";
 import { portalRouteInventory, registerPortalRoutes } from "./portal-routes.ts";
 import type { PostgresPortalInstallState } from "../../../packages/service/src/portal-install-state.ts";
-import { ServiceTokenVerifier } from "../../../packages/service/src/service-token.ts";
+import { ServiceTokenVerifier, type ReplayStore } from "../../../packages/service/src/service-token.ts";
 
 export type DdiApiService = {
   authenticate(token: string): Promise<Actor | null>;
@@ -62,6 +62,8 @@ type Deps = {
   commercial?: CommercialApi;
   /** D3C-B: Portal install-state propagation. Absent means the event route fails closed with 503. */
   installState?: PostgresPortalInstallState;
+  /** D3C-C: shared atomic replay store for service tokens. Required in production. */
+  serviceReplay?: ReplayStore;
   now?: () => Date;
   database?: () => Promise<"UP" | "DOWN" | "UNCONFIGURED">;
   identity?: () => Promise<"CONNECTED" | "DEGRADED" | "UNAVAILABLE">;
@@ -87,7 +89,7 @@ export function resultStatus(status: CapabilityResult["status"]) {
   return 400;
 }
 
-export function buildApi({ service, config, commercial, installState, now, database = async () => "UNCONFIGURED", identity = async () => "CONNECTED" }: Deps) {
+export function buildApi({ service, config, commercial, installState, serviceReplay, now, database = async () => "UNCONFIGURED", identity = async () => "CONNECTED" }: Deps) {
   const app = Fastify({ logger: false });
   const actorFrom = async (header: string | undefined) => header?.startsWith("Bearer ") ? service.authenticate(header.slice(7)) : null;
   const applicationFrom = async (header: string | undefined) => header?.startsWith("Application ") ? service.authenticateApplication(header.slice("Application ".length)) : null;
@@ -264,7 +266,9 @@ export function buildApi({ service, config, commercial, installState, now, datab
     } catch { return reply.code(503).send({ code: "UNAVAILABLE" }); }
   });
   // Service callers are authenticated by pinned keys; permissions come from DDI's own trust configuration.
-  const serviceAuth = Object.keys(config.trustedServices).length ? new ServiceTokenVerifier({ audience: config.serviceSigner?.serviceId ?? "ddi", services: config.trustedServices, production: config.environment === "production", now: now ? () => now().getTime() : undefined }) : undefined;
+  // A per-process replay cache cannot stop a token replayed against another instance: production needs the shared store.
+  if (config.environment === "production" && Object.keys(config.trustedServices).length && !serviceReplay) throw new Error("DDI_PRODUCTION_CONFIGURATION_INVALID");
+  const serviceAuth = Object.keys(config.trustedServices).length ? new ServiceTokenVerifier({ audience: config.serviceSigner?.serviceId ?? "ddi", services: config.trustedServices, production: config.environment === "production", now: now ? () => now().getTime() : undefined, replay: serviceReplay }) : undefined;
   registerCommercialRoutes(app, { commercial, actorFrom, applicationFrom, getInfrastructure: id => service.getInfrastructure(id), serviceAuth });
   registerPortalRoutes(app, { serviceAuth, installState, now });
   return app;

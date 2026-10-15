@@ -94,7 +94,7 @@ describe("D3B commercial activation, licensing and property provisioning", { con
     await bootstrap.query(`CREATE SCHEMA ${schema}`);
     await bootstrap.end();
     pool = new Pool({ connectionString: databaseUrl, max: 16, options: `-c search_path=${schema}` });
-    for (const migration of ["001_ddi_foundation.sql", "002_ddi_runtime.sql", "003_pdi_connections.sql", "004_connected_properties.sql", "005_commercial_activation.sql", "006_commercial_recovery.sql", "007_portal_install_state.sql", "008_download_grant_version.sql"]) await migrate(pool, join("migrations", migration));
+    for (const migration of ["001_ddi_foundation.sql", "002_ddi_runtime.sql", "003_pdi_connections.sql", "004_connected_properties.sql", "005_commercial_activation.sql", "006_commercial_recovery.sql", "007_portal_install_state.sql", "008_download_grant_version.sql", "009_service_token_replay.sql"]) await migrate(pool, join("migrations", migration));
     // Migrations are re-runnable without error.
     await migrate(pool, join("migrations", "005_commercial_activation.sql"));
     ddi = new PostgresDdiRepository(pool);

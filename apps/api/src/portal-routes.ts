@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { PORTAL_INSTALL_EVENT_TYPES, type PortalInstallEvent, type PostgresPortalInstallState } from "../../../packages/service/src/portal-install-state.ts";
-import { bearer, type ServiceTokenVerifier } from "../../../packages/service/src/service-token.ts";
+import { bearer, ServiceReplayUnavailable, type ServiceTokenVerifier } from "../../../packages/service/src/service-token.ts";
 
 export const PORTAL_INSTALL_EVENTS_CONTRACT = "portal.install-events.v1";
 export const portalRouteInventory = [
@@ -17,7 +17,9 @@ const ID = /^[A-Za-z0-9:_.-]{1,200}$/;
 export function registerPortalRoutes(app: FastifyInstance, deps: { serviceAuth?: ServiceTokenVerifier; installState?: PostgresPortalInstallState; now?: () => Date }) {
   app.post("/internal/portal/install-events", async (request, reply) => {
     if (!deps.serviceAuth || !deps.installState) return reply.code(503).send({ code: "PORTAL_EVENTS_UNAVAILABLE" });
-    const caller = deps.serviceAuth.verify(bearer(request.headers.authorization), { method: "POST", path: "/internal/portal/install-events" });
+    let caller;
+    try { caller = await deps.serviceAuth.verify(bearer(request.headers.authorization), { method: "POST", path: "/internal/portal/install-events" }); }
+    catch (error) { if (error instanceof ServiceReplayUnavailable) return reply.code(503).send({ code: error.message }); throw error; }
     if (!caller) return reply.code(401).send({ code: "SERVICE_AUTHENTICATION_REQUIRED" });
     if (!caller.permissions.includes("portal:install-events")) return reply.code(403).send({ code: "FORBIDDEN" });
     const body = request.body as Record<string, unknown> | undefined;

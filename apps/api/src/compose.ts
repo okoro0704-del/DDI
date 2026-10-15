@@ -10,6 +10,7 @@ import { loadCatalog } from "../../../packages/service/src/commercial-catalog.ts
 import { PostgresCommercialRepository } from "../../../packages/service/src/commercial-repository.ts";
 import { PostgresPortalInstallState } from "../../../packages/service/src/portal-install-state.ts";
 import { HttpPortalProvisioner } from "../../../packages/service/src/portal-provisioner.ts";
+import { PostgresReplayStore } from "../../../packages/service/src/service-token.ts";
 import { CanonicalTrustIdVerifier } from "../../../packages/service/src/trustid.ts";
 import { buildApi } from "./app.ts";
 
@@ -45,6 +46,6 @@ export async function composeRuntime(env: NodeJS.ProcessEnv = process.env) {
     : new UnavailableCommercialProvisioner();
   const commercial = catalog ? new CommercialService({ repository: new PostgresCommercialRepository(pool), pdi: repository, ownership, provisioner, catalog, pepper: config.activationCodePepper!, downloadTtlSeconds: config.downloadGrantTtlSeconds }) : undefined;
   const installState = new PostgresPortalInstallState(pool);
-  const app = buildApi({ service, config, commercial, installState, database: () => postgresHealth(pool), identity: () => identityVerifier.health() });
+  const app = buildApi({ service, config, commercial, installState, serviceReplay: new PostgresReplayStore(pool, "ddi_service_token_replay"), database: () => postgresHealth(pool), identity: () => identityVerifier.health() });
   return { app, pool, config, service, commercial, installState, ownership };
 }

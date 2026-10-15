@@ -59,6 +59,7 @@ describe("DDI reusable authority grant alignment", { concurrency: 1 }, () => {
     await migrate(pool, join("migrations", "006_commercial_recovery.sql"));
     await migrate(pool, join("migrations", "007_portal_install_state.sql"));
     await migrate(pool, join("migrations", "008_download_grant_version.sql"));
+    await migrate(pool, join("migrations", "009_service_token_replay.sql"));
     repository = new PostgresDdiRepository(pool);
     const bridge = await import(pathToFileURL(join(trustRoot, "packages/digi-bridge/dist/index.js")).href) as { openPostgresDigiCore(url: string, options: { schema: string }): Promise<{ owners: unknown; replay: unknown; sessions: unknown; runWrite: unknown; close(): Promise<void> }> };
     const authorityPackage = await import(pathToFileURL(join(trustRoot, "packages/digi-authority/dist/index.js")).href) as { PostgresAuthorityStore: new (url: string) => { close(): Promise<void> } };

@@ -13,14 +13,14 @@ const forge = (header: object, claims: object) => {
   return `${h}.${p}.${sign(null, Buffer.from(`${h}.${p}`), md.signer.privateKey).toString("base64url")}`;
 };
 
-test("a pinned, unexpired, audience- and request-bound token verifies once with configured permissions", () => {
+test("a pinned, unexpired, audience- and request-bound token verifies once with configured permissions", async () => {
   const v = verifier();
   const token = md.token("ddi", "POST", "/internal/downloads/redeem");
-  assert.deepEqual(v.verify(token, request)?.permissions, ["downloads:redeem"]);
-  assert.equal(v.verify(token, request), null, "replayed jti");
+  assert.deepEqual((await v.verify(token, request))?.permissions, ["downloads:redeem"]);
+  assert.equal(await v.verify(token, request), null, "replayed jti");
 });
 
-test("invalid service tokens fail closed", () => {
+test("invalid service tokens fail closed", async () => {
   const v = verifier();
   const now = Math.floor(Date.now() / 1000);
   const base = { iss: "master-distributor", sub: "master-distributor", aud: "ddi", iat: now, exp: now + 60, jti: "j", htm: "POST", htu: "/internal/downloads/redeem" };
@@ -40,16 +40,16 @@ test("invalid service tokens fail closed", () => {
     ["alg none", `${Buffer.from(JSON.stringify({ ...header, alg: "none" })).toString("base64url")}.${Buffer.from(JSON.stringify({ ...base, jti: "n" })).toString("base64url")}.`],
     ["tampered payload", (() => { const t = md.token("ddi", "POST", "/internal/downloads/redeem").split("."); t[1] = Buffer.from(JSON.stringify({ ...base, jti: "t", aud: "ddi" })).toString("base64url"); return t.join("."); })()],
   ];
-  for (const [name, token] of cases) assert.equal(v.verify(token, request), null, name);
+  for (const [name, token] of cases) assert.equal(await v.verify(token, request), null, name);
 });
 
-test("forged role or permission claims grant nothing beyond DDI's configuration", () => {
+test("forged role or permission claims grant nothing beyond DDI's configuration", async () => {
   const now = Math.floor(Date.now() / 1000);
   const token = forge({ alg: "EdDSA", typ: "digiconomy-service+jwt", kid: md.keyId }, { iss: "master-distributor", sub: "master-distributor", aud: "ddi", iat: now, exp: now + 60, jti: "r", htm: "POST", htu: "/internal/downloads/redeem", roles: ["admin"], permissions: ["*", "operator"], scope: "admin" });
-  assert.deepEqual(verifier().verify(token, request)?.permissions, ["downloads:redeem"]);
+  assert.deepEqual((await verifier().verify(token, request))?.permissions, ["downloads:redeem"]);
 });
 
-test("test-labelled keys are never a production trust anchor", () => {
-  assert.equal(verifier(Date.now(), true).verify(md.token("ddi", "POST", "/internal/downloads/redeem"), request), null);
+test("test-labelled keys are never a production trust anchor", async () => {
+  assert.equal(await verifier(Date.now(), true).verify(md.token("ddi", "POST", "/internal/downloads/redeem"), request), null);
   assert.ok(signServiceToken(md.signer, { audience: "ddi", method: "POST", path: "/x" }));
 });

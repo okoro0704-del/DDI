@@ -1,4 +1,5 @@
 import test from "node:test";
+import { generateKeyPairSync } from "node:crypto";
 import assert from "node:assert/strict";
 import { generateActivationCode, hashActivationSecret, parseActivationCode, sameDigest } from "../packages/service/src/activation-code.ts";
 import { CommercialService, UnavailableCommercialProvisioner } from "../packages/service/src/commercial.ts";
@@ -48,8 +49,13 @@ test("the catalog is configuration only and rejects inconsistent plan definition
 });
 
 test("production refuses a commercial catalog without a strong pepper or with a weak distributor secret", () => {
-  const base = { DDI_ENV: "production", DATABASE_URL: "postgresql://ddi@127.0.0.1/ddi", TRUSTID_ISSUER: "i", TRUSTID_AUDIENCE: "a", TRUSTID_JWKS_URL: "https://j", TRUSTID_BRIDGE_MODULE_URL: "file:///b", DDI_ALLOWED_ORIGINS: "https://o", DIGI_CORE_URL: "https://c", DIGI_AUTHORITY_URL: "https://a", DIGI_AUTHORITY_JWKS_URL: "https://a/j", DIGI_AUTHORITY_VERIFIER_MODULE_URL: "file:///v", PORTAL_OWNERSHIP_URL: "https://p", PORTAL_OWNERSHIP_SHARED_SECRET: "s" };
+  // An ephemeral in-memory key (never persisted, not a production key) only exercises config validation.
+  const ephemeral = generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const base = { DDI_SERVICE_ID: "ddi", DDI_SERVICE_KEY_ID: "ci-ephemeral-ddi", DDI_SERVICE_PRIVATE_KEY: ephemeral, DDI_ENV: "production", DATABASE_URL: "postgresql://ddi@127.0.0.1/ddi", TRUSTID_ISSUER: "i", TRUSTID_AUDIENCE: "a", TRUSTID_JWKS_URL: "https://j", TRUSTID_BRIDGE_MODULE_URL: "file:///b", DDI_ALLOWED_ORIGINS: "https://o", DIGI_CORE_URL: "https://c", DIGI_AUTHORITY_URL: "https://a", DIGI_AUTHORITY_JWKS_URL: "https://a/j", DIGI_AUTHORITY_VERIFIER_MODULE_URL: "file:///v", PORTAL_OWNERSHIP_URL: "https://p", PORTAL_OWNERSHIP_SHARED_SECRET: "s" };
   assert.doesNotThrow(() => readConfig(base));
+  // D3C-C: production requires DDI's own service identity; a shared secret alone is refused, as is a test key.
+  assert.throws(() => readConfig({ ...base, DDI_SERVICE_PRIVATE_KEY: undefined }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
+  assert.throws(() => readConfig({ ...base, DDI_SERVICE_KEY_ID: "test-ddi" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
   assert.throws(() => readConfig({ ...base, DDI_COMMERCIAL_CATALOG: JSON.stringify(catalog()) }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
   assert.throws(() => readConfig({ ...base, DDI_COMMERCIAL_CATALOG: JSON.stringify(catalog()), DDI_ACTIVATION_CODE_PEPPER: "too-short" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
   assert.doesNotThrow(() => readConfig({ ...base, DDI_COMMERCIAL_CATALOG: JSON.stringify(catalog()), DDI_ACTIVATION_CODE_PEPPER: "x".repeat(32) }));

@@ -1,4 +1,5 @@
 import test from "node:test";
+import { generateKeyPairSync } from "node:crypto";
 import assert from "node:assert/strict";
 import type { Actor, CapabilityRequest, CapabilityResult } from "../packages/contracts/src/index.ts";
 import { buildApi, resultStatus, routeInventory, type DdiApiService } from "../apps/api/src/app.ts";
@@ -91,10 +92,13 @@ test("execute uses the canonical pipeline and truthful statuses", async () => {
   await app.close();
 });
 
+/** D3C-C: production requires DDI's own service identity. An ephemeral in-memory key, never persisted, only completes the config. */
+const ephemeralDdiIdentity = () => ({ DDI_SERVICE_ID: "ddi", DDI_SERVICE_KEY_ID: "ci-ephemeral-ddi", DDI_SERVICE_PRIVATE_KEY: generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }).toString() });
+
 test("production composition fails closed without postgres or digi configuration", async () => {
   assert.throws(() => readConfig({ DDI_ENV: "production" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
   assert.throws(() => readConfig({ DDI_ENV: "production", DATABASE_URL: "postgres://127.0.0.1/ddi", TRUSTID_ISSUER: "https://issuer.test", TRUSTID_AUDIENCE: "aud", TRUSTID_JWKS_URL: "https://issuer.test/jwks", DDI_ALLOWED_ORIGINS: "https://app.example.test" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
-  await assert.rejects(composeRuntime({ DDI_ENV: "production", DATABASE_URL: "postgres://127.0.0.1:1/ddi", TRUSTID_ISSUER: "https://issuer.test", TRUSTID_AUDIENCE: "aud", TRUSTID_JWKS_URL: "https://issuer.test/jwks", TRUSTID_BRIDGE_MODULE_URL: new URL("./fixtures/verifier-stub.mjs", import.meta.url).href, DDI_ALLOWED_ORIGINS: "https://app.example.test", DIGI_CORE_URL: "http://127.0.0.1:9", DIGI_AUTHORITY_URL: "http://127.0.0.1:9", DIGI_AUTHORITY_JWKS_URL: "http://127.0.0.1:9/jwks", DIGI_AUTHORITY_VERIFIER_MODULE_URL: new URL("./fixtures/verifier-stub.mjs", import.meta.url).href, PORTAL_OWNERSHIP_URL: "https://portal.example.test/internal/ddi/ownership/verify", PORTAL_OWNERSHIP_SHARED_SECRET: "test-only-shared-secret" }), /DDI_POSTGRES_UNAVAILABLE/);
+  await assert.rejects(composeRuntime({ DDI_ENV: "production", DATABASE_URL: "postgres://127.0.0.1:1/ddi", TRUSTID_ISSUER: "https://issuer.test", TRUSTID_AUDIENCE: "aud", TRUSTID_JWKS_URL: "https://issuer.test/jwks", TRUSTID_BRIDGE_MODULE_URL: new URL("./fixtures/verifier-stub.mjs", import.meta.url).href, DDI_ALLOWED_ORIGINS: "https://app.example.test", DIGI_CORE_URL: "http://127.0.0.1:9", DIGI_AUTHORITY_URL: "http://127.0.0.1:9", DIGI_AUTHORITY_JWKS_URL: "http://127.0.0.1:9/jwks", DIGI_AUTHORITY_VERIFIER_MODULE_URL: new URL("./fixtures/verifier-stub.mjs", import.meta.url).href, PORTAL_OWNERSHIP_URL: "https://portal.example.test/internal/ddi/ownership/verify", PORTAL_OWNERSHIP_SHARED_SECRET: "test-only-shared-secret", ...ephemeralDdiIdentity() }), /DDI_POSTGRES_UNAVAILABLE/);
 });
 
 test("session and authority clients fail closed and do not consume a rejected token", async () => {
