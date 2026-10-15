@@ -2,7 +2,8 @@
 /**
  * D3D-A CI safety gate. Fails closed before any test runs.
  *
- * 1. Every URL-shaped environment value points at loopback (127.0.0.1, localhost, ::1).
+ * 1. Every URL-shaped environment value points at loopback (127.0.0.1, localhost, ::1), except the
+ *    runner's own ACTIONS_* / GITHUB_* / RUNNER_* variables (github.com service endpoints the runner sets).
  * 2. No environment value names a hosted Digiconomy endpoint (Railway, Netlify, getlifeos.app, Supabase).
  * 3. No credential-shaped variable is present (names containing SECRET, PRIVATE_KEY, TOKEN, PASSWORD,
  *    API_KEY), except the runner's own ACTIONS_* / GITHUB_* plumbing. Test identities are generated
@@ -33,6 +34,7 @@ for (let i = 0; i < args.length; i++) {
 for (const [name, value] of Object.entries(process.env)) {
   if (!value) continue;
   if (HOSTED.test(value)) failures.push(`${name} names a hosted endpoint`);
+  if (RUNNER_PLUMBING.test(name)) continue;
   for (const match of value.matchAll(/\b(?:https?|postgres(?:ql)?|redis|wss?):\/\/[^\s"']+/gi)) {
     let host;
     try { host = new URL(match[0]).hostname; } catch { failures.push(`${name} holds an unparseable URL`); continue; }
