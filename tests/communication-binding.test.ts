@@ -41,12 +41,16 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     let log = "";
     elfcom.stdout?.on("data", (chunk) => { log += String(chunk); });
     elfcom.stderr?.on("data", (chunk) => { log += String(chunk); });
+    // Ready means ElfCom answers GET /health, not that it printed a line; a cold tsx compile under
+    // load can be slow, so the ceiling is generous and an early exit fails at once.
     const started = Date.now();
-    while (!log.includes("listening") && Date.now() - started < 60000) {
+    let healthy = false;
+    while (!healthy && Date.now() - started < 120_000) {
       if (elfcom.exitCode !== null) throw new Error(log.slice(-1000));
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      healthy = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false);
+      if (!healthy) await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    if (!log.includes("listening")) throw new Error(log.slice(-1000));
+    if (!healthy) throw new Error(`ElfCom never became healthy: ${log.slice(-1000)}`);
     const admin = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 5000 });
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
