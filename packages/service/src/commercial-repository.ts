@@ -301,6 +301,41 @@ export class PostgresCommercialRepository {
     return result.rows.map(row => ({ id: row.id, status: row.status, attempts: row.attempts, lastError: row.last_error ?? undefined, nextAttemptAt: iso(row.next_attempt_at) }));
   }
 
+  /** Operator view: redemption and outbox state. No secrets are stored, so none are returned. */
+  async redemptionDetail(id: string) {
+    const found = await this.getRedemption(id);
+    if (!found) return null;
+    const outbox = await this.pool.query<{ id: string; status: string; attempts: number; max_attempts: number; requeue_count: number; max_requeues: number; last_error: string | null; next_attempt_at: Date; locked_until: Date | null }>(`SELECT id, status, attempts, max_attempts, requeue_count, max_requeues, last_error, next_attempt_at, locked_until FROM ddi_commercial_outbox WHERE aggregate_id = $1`, [id]);
+    return { redemption: found.redemption, outbox: outbox.rows.map(row => ({ id: row.id, status: row.status, attempts: row.attempts, maxAttempts: row.max_attempts, requeueCount: row.requeue_count, maxRequeues: row.max_requeues, lastError: row.last_error ?? undefined, nextAttemptAt: iso(row.next_attempt_at), lockedUntil: optionalIso(row.locked_until) })) };
+  }
+
+  /**
+   * Bounded operator retry. Only re-schedules the existing job: it creates no
+   * entitlement, license, property or PDI, and changes no status other than
+   * returning an ATTENTION_REQUIRED redemption to PROVISIONING_PENDING. Every
+   * step it re-runs is idempotent and re-verifies ownership with the Portal.
+   */
+  async requeueOutbox(redemptionId: string, input: { actor: string; reason: string; at: Date; correlationId: string }) {
+    return this.transaction(async client => {
+      const jobs = await client.query<{ id: string; status: string; locked_until: Date | null; requeue_count: number; max_requeues: number }>(`SELECT id, status, locked_until, requeue_count, max_requeues FROM ddi_commercial_outbox WHERE aggregate_id = $1 FOR UPDATE`, [redemptionId]);
+      const job = jobs.rows[0];
+      if (!job) throw new Error("OUTBOX_JOB_NOT_FOUND");
+      if (job.status === "DONE") throw new Error("OUTBOX_JOB_COMPLETE");
+      if (job.status === "IN_PROGRESS" && job.locked_until && job.locked_until.getTime() > input.at.getTime()) throw new Error("OUTBOX_JOB_IN_PROGRESS");
+      if (job.requeue_count >= job.max_requeues) throw new Error("OUTBOX_REQUEUE_LIMIT");
+      const redemption = await client.query<RedemptionRow>(`SELECT ${REDEMPTION_COLUMNS} FROM ddi_activation_redemptions WHERE id = $1 FOR UPDATE`, [redemptionId]);
+      const row = redemption.rows[0];
+      if (!row) throw new Error("REDEMPTION_NOT_FOUND");
+      if (row.status === "COMPLETED" || row.status === "CANCELLED") throw new Error("OUTBOX_JOB_COMPLETE");
+      const license = await client.query<{ status: string }>(`SELECT status FROM ddi_licenses WHERE id = $1`, [row.license_id]);
+      if (license.rows[0]?.status === "REVOKED") throw new Error("LICENSE_REVOKED");
+      await client.query(`UPDATE ddi_commercial_outbox SET status = 'PENDING', attempts = 0, next_attempt_at = $2, lease_token = NULL, locked_until = NULL, completed_at = NULL, requeue_count = requeue_count + 1, updated_at = $2 WHERE id = $1`, [job.id, iso(input.at)]);
+      await client.query(`UPDATE ddi_activation_redemptions SET status = 'PROVISIONING_PENDING', updated_at = $2 WHERE id = $1 AND status = 'ATTENTION_REQUIRED'`, [redemptionId, iso(input.at)]);
+      await this.audit({ eventType: "OUTBOX_REQUEUED", correlationId: input.correlationId, actor: input.actor, ownerId: row.owner_id as DigiOwnerId, redemptionId: row.id as Redemption["id"], licenseId: row.license_id as License["id"], propertyId: (row.property_id ?? undefined) as Redemption["propertyId"], result: `REQUEUED:${job.requeue_count + 1}/${job.max_requeues}`, reason: input.reason, timestamp: iso(input.at) }, client);
+      return { requeueCount: job.requeue_count + 1, maxRequeues: job.max_requeues };
+    });
+  }
+
   async markProvisioned(redemptionId: string, reference: string, at: Date, correlationId: string) {
     await this.transaction(async client => {
       const updated = await client.query<RedemptionRow>(`UPDATE ddi_activation_redemptions SET provisioning_reference = $2, provisioned_at = $3, updated_at = $3 WHERE id = $1 AND provisioned_at IS NULL RETURNING ${REDEMPTION_COLUMNS}`, [redemptionId, reference, iso(at)]);
@@ -308,15 +343,21 @@ export class PostgresCommercialRepository {
       if (row) await this.audit({ eventType: "PROVISIONING_SUCCEEDED", correlationId, actor: "system:outbox", ownerId: row.owner_id as DigiOwnerId, redemptionId: row.id as Redemption["id"], licenseId: row.license_id as License["id"], propertyId: (row.property_id ?? undefined) as Redemption["propertyId"], result: "PROVISIONED", timestamp: iso(at) }, client);
     });
   }
-  /** Conditional promotion; a revoked or failed property can never be re-activated here. */
-  async activateProperty(redemptionId: string, at: Date, correlationId: string) {
+  /**
+   * Conditional promotion; a revoked or failed property can never be re-activated here.
+   * Promotion also re-binds to DDI's own records: the property must still belong to the
+   * redeeming owner and to that owner's ACTIVE PERSONAL PDI, so a fresh Portal READY for a
+   * stale or different owner cannot activate it. The fresh receipt replaces the bootstrap one.
+   */
+  async activateProperty(redemptionId: string, at: Date, correlationId: string, ownershipEvidence?: string) {
     return this.transaction(async client => {
       const result = await client.query<RedemptionRow>(`SELECT ${REDEMPTION_COLUMNS} FROM ddi_activation_redemptions WHERE id = $1 FOR UPDATE`, [redemptionId]);
       const row = result.rows[0];
       if (!row?.property_id) return false;
-      const promoted = await client.query(`UPDATE ddi_connected_properties SET status = 'ACTIVE', updated_at = $2 WHERE id = $1 AND status = 'PENDING_ACTIVATION'`, [row.property_id, iso(at)]);
-      const property = await client.query<{ status: string }>(`SELECT status FROM ddi_connected_properties WHERE id = $1`, [row.property_id]);
-      if (property.rows[0]?.status !== "ACTIVE") return false;
+      const promoted = await client.query(`UPDATE ddi_connected_properties p SET status = 'ACTIVE', ownership_evidence = COALESCE($5, p.ownership_evidence), updated_at = $2 WHERE p.id = $1 AND p.status = 'PENDING_ACTIVATION' AND p.owner_id = $3 AND p.infrastructure_id = $4 AND EXISTS (SELECT 1 FROM ddi_infrastructures i WHERE i.id = $4 AND i.owner_id = $3 AND i.type = 'PERSONAL' AND i.status = 'ACTIVE')`, [row.property_id, iso(at), row.owner_id, row.infrastructure_id, ownershipEvidence ?? null]);
+      const property = await client.query<{ status: string; owner_id: string; infrastructure_id: string }>(`SELECT status, owner_id, infrastructure_id FROM ddi_connected_properties WHERE id = $1`, [row.property_id]);
+      const current = property.rows[0];
+      if (current?.status !== "ACTIVE" || current.owner_id !== row.owner_id || current.infrastructure_id !== row.infrastructure_id) return false;
       if (!row.activated_at) await client.query(`UPDATE ddi_activation_redemptions SET activated_at = $2, updated_at = $2 WHERE id = $1`, [redemptionId, iso(at)]);
       if (promoted.rowCount === 1) {
         await client.query(`INSERT INTO ddi_connection_audits (id, event_type, correlation_id, owner_id, infrastructure_id, property_id, result, timestamp) VALUES ($1,'PROPERTY_CONNECTED',$2,$3,$4,$5,'ACTIVE',$6)`, [randomUUID(), correlationId, row.owner_id, row.infrastructure_id, row.property_id, iso(at)]);

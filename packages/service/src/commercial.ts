@@ -233,11 +233,12 @@ export class CommercialService {
   }
 
   /** Called by the authenticated distributor at delivery time. Revocation or expiry after issuance still denies. */
-  async redeemDownload(token: unknown, expected: { artifactId: unknown; productId?: unknown }, correlationId: string) {
+  async redeemDownload(token: unknown, expected: { artifactId: unknown; productId?: unknown; propertyId?: unknown }, correlationId: string) {
     const at = this.now();
     if (typeof token !== "string" || !token.startsWith("ddidl_") || token.length > 100 || typeof expected.artifactId !== "string") throw new Error("DOWNLOAD_GRANT_INVALID");
     const outcome = await this.repository.consumeDownloadGrant(hashDownloadToken(token), at, async grant => {
-      if (grant.artifact_id !== expected.artifactId || (expected.productId !== undefined && grant.product_id !== expected.productId)) return "DOWNLOAD_SCOPE_MISMATCH";
+      // A distributor fulfilling for one property cannot spend a grant scoped to another (or to none).
+      if (grant.artifact_id !== expected.artifactId || (expected.productId !== undefined && grant.product_id !== expected.productId) || (expected.propertyId !== undefined && grant.property_id !== expected.propertyId)) return "DOWNLOAD_SCOPE_MISMATCH";
       const verification = await this.verifyLicense(grant.license_id, { ownerId: grant.owner_id, productId: grant.product_id, propertyId: grant.property_id });
       if (!verification.valid) return verification.reason;
       return verification.entitlement.downloads.includes(grant.artifact_id) ? null : "DOWNLOAD_NOT_ENTITLED";
@@ -246,6 +247,24 @@ export class CommercialService {
     await this.repository.audit({ eventType: outcome.ok ? "DOWNLOAD_REDEEMED" : "DOWNLOAD_DENIED", correlationId, actor: "service:distributor", ownerId: grant?.owner_id as DigiOwnerId | undefined, licenseId: grant?.license_id as License["id"] | undefined, entitlementId: grant?.entitlement_id as License["entitlementId"] | undefined, propertyId: (grant?.property_id ?? undefined) as License["propertyId"], productId: grant?.product_id, result: outcome.ok ? "CONSUMED" : "DENIED", reason: outcome.ok ? `artifact:${grant!.artifact_id}` : outcome.reason, timestamp: at.toISOString() }).catch(() => undefined);
     if (!outcome.ok) throw new Error(outcome.reason);
     return { ownerId: outcome.grant.owner_id, licenseId: outcome.grant.license_id, productId: outcome.grant.product_id, artifactId: outcome.grant.artifact_id, propertyId: outcome.grant.property_id ?? undefined };
+  }
+
+  async getRedemptionDetail(actor: Actor | null | undefined, id: string) {
+    await this.requireOperator(actor, ["COMMERCIAL_ADMIN"]);
+    const detail = await this.repository.redemptionDetail(id);
+    if (!detail) throw new Error("REDEMPTION_NOT_FOUND");
+    return detail;
+  }
+
+  /** Operator recovery: ADMIN only, reason required, bounded, audited, then processed immediately. */
+  async requeueRedemption(actor: Actor | null | undefined, id: string, reason: unknown, correlationId: string) {
+    const operator = await this.requireOperator(actor, ["COMMERCIAL_ADMIN"]);
+    const why = text(reason, 200);
+    if (!why) throw new Error("REASON_REQUIRED");
+    const requeued = await this.repository.requeueOutbox(id, { actor: `operator:${operator.ownerId}`, reason: why, at: this.now(), correlationId });
+    const run = await this.runOutbox({ aggregateId: id, limit: 1 });
+    const detail = await this.repository.redemptionDetail(id);
+    return { ...requeued, run, redemption: detail?.redemption, outbox: detail?.outbox };
   }
 
   async runOutboxAsOperator(actor: Actor | null | undefined, limit = 20) {
@@ -313,8 +332,9 @@ export class CommercialService {
         else if (!trustSubject) terminal = "TRUSTID_SUBJECT_REQUIRED";
         else {
           try {
-            await this.options.ownership.verify({ trustIdSubject: trustSubject, externalSystem: property.externalSystem, externalReference: property.externalReference, type: property.type, purpose: "ACTIVATE" });
-            if (!await this.repository.activateProperty(redemption.id, this.now(), correlationId)) terminal = "PROPERTY_NOT_ACTIVATABLE";
+            // Final authoritative re-check: READY now, for the same owner who redeemed.
+            const verification = await this.options.ownership.verify({ trustIdSubject: trustSubject, externalSystem: property.externalSystem, externalReference: property.externalReference, type: property.type, purpose: "ACTIVATE" });
+            if (!await this.repository.activateProperty(redemption.id, this.now(), correlationId, ownershipReceipt(verification))) terminal = "PROPERTY_NOT_ACTIVATABLE";
           } catch (error) {
             const reason = code(error);
             if (reason === "OWNERSHIP_NOT_VERIFIED") {

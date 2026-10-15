@@ -4,7 +4,7 @@ import type { Actor, ApplicationRecord, InfrastructureRecord } from "../../../pa
 import type { CommercialService } from "../../../packages/service/src/commercial.ts";
 import type { LifecycleAction } from "../../../packages/service/src/commercial-repository.ts";
 
-export type CommercialApi = Pick<CommercialService, "issueCode" | "revokeCode" | "getCode" | "redeem" | "getRedemption" | "listEntitlements" | "listLicenses" | "getLicense" | "verifyLicense" | "changeLicense" | "changeEntitlement" | "authorizeDownload" | "redeemDownload" | "runOutboxAsOperator">;
+export type CommercialApi = Pick<CommercialService, "issueCode" | "revokeCode" | "getCode" | "redeem" | "getRedemption" | "listEntitlements" | "listLicenses" | "getLicense" | "verifyLicense" | "changeLicense" | "changeEntitlement" | "authorizeDownload" | "redeemDownload" | "runOutboxAsOperator" | "getRedemptionDetail" | "requeueRedemption">;
 
 export const commercialRouteInventory = [
   { method: "POST", url: "/me/activations/redeem", access: "AUTHENTICATED_OWNER_COMMERCIAL" },
@@ -21,13 +21,15 @@ export const commercialRouteInventory = [
   { method: "POST", url: "/admin/commercial/licenses/:id/:action", access: "COMMERCIAL_OPERATOR" },
   { method: "POST", url: "/admin/commercial/entitlements/:id/:action", access: "COMMERCIAL_OPERATOR" },
   { method: "POST", url: "/admin/commercial/outbox/run", access: "COMMERCIAL_OPERATOR" },
+  { method: "GET", url: "/admin/commercial/redemptions/:id", access: "COMMERCIAL_OPERATOR" },
+  { method: "POST", url: "/admin/commercial/redemptions/:id/requeue", access: "COMMERCIAL_OPERATOR" },
 ] as const;
 
 const STATUS: Record<string, number> = {
   OWNER_REQUIRED: 401,
   OPERATOR_REQUIRED: 403, OWNERSHIP_NOT_VERIFIED: 403, TRUSTID_SUBJECT_REQUIRED: 403, DOWNLOAD_NOT_ENTITLED: 403, LICENSE_REVOKED: 403, LICENSE_SUSPENDED: 403, LICENSE_EXPIRED: 403, PROPERTY_NOT_ACTIVE: 403, PROPERTY_MISMATCH: 403, PRODUCT_MISMATCH: 403, DOWNLOAD_SCOPE_MISMATCH: 403, DOWNLOAD_GRANT_INVALID: 403, DOWNLOAD_GRANT_CONSUMED: 403, DOWNLOAD_GRANT_EXPIRED: 403, PROPERTY_TYPE_NOT_ENTITLED: 403,
   LICENSE_NOT_FOUND: 404, REDEMPTION_NOT_FOUND: 404, ACTIVATION_CODE_NOT_FOUND: 404, ENTITLEMENT_NOT_FOUND: 404, PLAN_NOT_FOUND: 404,
-  ACTIVATION_CODE_ALREADY_REDEEMED: 409, IDEMPOTENCY_CONFLICT: 409, PROPERTY_REFERENCE_CONFLICT: 409, PROPERTY_TYPE_MISMATCH: 409, PROPERTY_NOT_ACTIVATABLE: 409, OWNERSHIP_VERIFICATION_PENDING: 409, LICENSE_NOT_MODIFIABLE: 409, ENTITLEMENT_NOT_MODIFIABLE: 409, ENTITLEMENT_EXPIRED: 409,
+  ACTIVATION_CODE_ALREADY_REDEEMED: 409, IDEMPOTENCY_CONFLICT: 409, PROPERTY_REFERENCE_CONFLICT: 409, PROPERTY_TYPE_MISMATCH: 409, PROPERTY_NOT_ACTIVATABLE: 409, OWNERSHIP_VERIFICATION_PENDING: 409, LICENSE_NOT_MODIFIABLE: 409, ENTITLEMENT_NOT_MODIFIABLE: 409, ENTITLEMENT_EXPIRED: 409, OUTBOX_JOB_COMPLETE: 409, OUTBOX_JOB_IN_PROGRESS: 409, OUTBOX_REQUEUE_LIMIT: 409, OUTBOX_JOB_NOT_FOUND: 404,
   ACTIVATION_CODE_EXPIRED: 410, ACTIVATION_CODE_REVOKED: 410,
   ACTIVATION_RATE_LIMITED: 429,
   UNAVAILABLE: 503, OWNERSHIP_VERIFICATION_UNAVAILABLE: 503, COMMERCIAL_UNAVAILABLE: 503, DOWNLOAD_DELIVERY_UNAVAILABLE: 503,
@@ -130,8 +132,8 @@ export function registerCommercialRoutes(app: FastifyInstance, deps: {
   app.post("/internal/downloads/redeem", async (request, reply) => {
     if (!deps.commercial || !deps.distributorSecret) return reply.code(503).send({ code: "COMMERCIAL_UNAVAILABLE" });
     if (!sameSecret(request.headers["x-ddi-distributor-secret"], deps.distributorSecret)) return reply.code(403).send({ code: "FORBIDDEN" });
-    const body = request.body as { token?: unknown; artifactId?: unknown; productId?: unknown } | undefined;
-    try { return await deps.commercial.redeemDownload(body?.token, { artifactId: body?.artifactId, productId: body?.productId }, correlation(request)); }
+    const body = request.body as { token?: unknown; artifactId?: unknown; productId?: unknown; propertyId?: unknown } | undefined;
+    try { return await deps.commercial.redeemDownload(body?.token, { artifactId: body?.artifactId, productId: body?.productId, propertyId: body?.propertyId }, correlation(request)); }
     catch (error) { return failure(reply, error); }
   });
 
@@ -170,6 +172,18 @@ export function registerCommercialRoutes(app: FastifyInstance, deps: {
     const action = ACTIONS[(request.params as { action: string }).action];
     if (!action) return reply.code(404).send({ code: "NOT_FOUND" });
     try { return await context.commercial.changeEntitlement(context.actor, id(request), action, (request.body as { reason?: unknown } | undefined)?.reason, correlation(request)); }
+    catch (error) { return failure(reply, error); }
+  });
+  app.get("/admin/commercial/redemptions/:id", async (request, reply) => {
+    const context = await owner(request, reply);
+    if (!context) return reply;
+    try { return await context.commercial.getRedemptionDetail(context.actor, id(request)); }
+    catch (error) { return failure(reply, error); }
+  });
+  app.post("/admin/commercial/redemptions/:id/requeue", async (request, reply) => {
+    const context = await owner(request, reply);
+    if (!context) return reply;
+    try { return await context.commercial.requeueRedemption(context.actor, id(request), (request.body as { reason?: unknown } | undefined)?.reason, correlation(request)); }
     catch (error) { return failure(reply, error); }
   });
   app.post("/admin/commercial/outbox/run", async (request, reply) => {

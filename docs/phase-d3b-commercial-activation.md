@@ -86,4 +86,4 @@ DATABASE_URL=... node scripts/commercial-operator.ts grant <canonical-owner-id> 
   composition uses `UnavailableCommercialProvisioner`, so redemptions stay
   `PROVISIONING_PENDING` (truthfully) until a real adapter is supplied.
 - The Master Distributor does not yet call `/internal/downloads/redeem`.
-- No renewal operation, operator requeue for `DEAD` jobs, or live payment.
+- No renewal operation or live payment. Operator requeue (bounded, audited) was added in D3C-A; see `docs/phase-d3c-integration-contracts.md`.
