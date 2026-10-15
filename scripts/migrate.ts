@@ -10,6 +10,7 @@ try {
   await migrate(pool, resolve("migrations/002_ddi_runtime.sql"));
   await migrate(pool, resolve("migrations/003_pdi_connections.sql"));
   await migrate(pool, resolve("migrations/004_connected_properties.sql"));
+  await migrate(pool, resolve("migrations/005_commercial_activation.sql"));
 } finally {
   await pool.end();
 }

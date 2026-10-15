@@ -25,7 +25,7 @@ describe("D1 connected digital properties", { concurrency: 1 }, () => {
     await admin.query(`CREATE SCHEMA ${schema}`);
     await admin.end();
     pool = new Pool({ connectionString: databaseUrl, max: 8, options: `-c search_path=${schema}` });
-    for (const migration of ["001_ddi_foundation.sql", "002_ddi_runtime.sql", "003_pdi_connections.sql", "004_connected_properties.sql"]) await migrate(pool, join("migrations", migration));
+    for (const migration of ["001_ddi_foundation.sql", "002_ddi_runtime.sql", "003_pdi_connections.sql", "004_connected_properties.sql", "005_commercial_activation.sql"]) await migrate(pool, join("migrations", migration));
     repository = new PostgresDdiRepository(pool);
   });
   after(async () => { await pool?.end(); });

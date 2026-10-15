@@ -12,6 +12,11 @@ export type DdiConfig = {
   digiAuthorityVerifierModuleUrl?: string;
   portalOwnershipUrl?: string;
   portalOwnershipSharedSecret?: string;
+  /** D3B: keyed-hash pepper for activation codes. Required whenever a commercial catalog is configured. */
+  activationCodePepper?: string;
+  /** D3B: Master Distributor service credential for single-use download-grant redemption. */
+  downloadDistributorSecret?: string;
+  downloadGrantTtlSeconds?: number;
 };
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): DdiConfig {
@@ -32,9 +37,14 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DdiConfig {
     digiAuthorityVerifierModuleUrl: env.DIGI_AUTHORITY_VERIFIER_MODULE_URL,
     portalOwnershipUrl: env.PORTAL_OWNERSHIP_URL,
     portalOwnershipSharedSecret: env.PORTAL_OWNERSHIP_SHARED_SECRET,
+    activationCodePepper: env.DDI_ACTIVATION_CODE_PEPPER,
+    downloadDistributorSecret: env.DDI_DOWNLOAD_DISTRIBUTOR_SECRET,
+    downloadGrantTtlSeconds: env.DDI_DOWNLOAD_GRANT_TTL_SECONDS ? Number(env.DDI_DOWNLOAD_GRANT_TTL_SECONDS) : undefined,
   };
   if (environment === "production") {
     if (!config.databaseUrl || !config.trustIdIssuer || !config.trustIdAudience || !config.trustIdJwksUrl || !config.trustIdBridgeModuleUrl || !allowedOrigins.length || !config.digiCoreUrl || !config.digiAuthorityUrl || !config.digiAuthorityJwksUrl || !config.digiAuthorityVerifierModuleUrl || !config.portalOwnershipUrl || !config.portalOwnershipSharedSecret) throw new Error("DDI_PRODUCTION_CONFIGURATION_INVALID");
+    if ((env.DDI_COMMERCIAL_CATALOG || env.DDI_COMMERCIAL_CATALOG_PATH) && (config.activationCodePepper ?? "").length < 32) throw new Error("DDI_PRODUCTION_CONFIGURATION_INVALID");
+    if (config.downloadDistributorSecret !== undefined && config.downloadDistributorSecret.length < 32) throw new Error("DDI_PRODUCTION_CONFIGURATION_INVALID");
     if (!config.databaseUrl.startsWith("postgres://") && !config.databaseUrl.startsWith("postgresql://")) throw new Error("DDI_POSTGRES_REQUIRED");
   }
   return config;

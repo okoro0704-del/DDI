@@ -3,6 +3,7 @@ import Fastify, { type FastifyReply } from "fastify";
 import type { Actor, ApplicationRecord, Capability, CapabilityRequest, CapabilityResult, ConnectedPropertyType, ExecutionMode, InfrastructureRecord, InfrastructureType, PdiApplicationConnection } from "../../../packages/contracts/src/index.ts";
 import { authorityBinding, describeCapabilities } from "../../../packages/core/src/connection.ts";
 import type { DdiConfig } from "../../../packages/service/src/config.ts";
+import { commercialRouteInventory, registerCommercialRoutes, type CommercialApi } from "./commercial-routes.ts";
 
 export type DdiApiService = {
   authenticate(token: string): Promise<Actor | null>;
@@ -47,11 +48,14 @@ export const routeInventory = [
   { method: "POST", url: "/connections/:id/capabilities/revoke", access: "OWNER_CONSENT" },
   { method: "GET", url: "/infrastructures/:id/infrastructure", access: "AUTHENTICATED_ADMINISTRATION" },
   { method: "POST", url: "/capabilities/execute", access: "AUTHORITY_ENFORCED" },
+  ...commercialRouteInventory,
 ] as const;
 
 type Deps = {
   service: DdiApiService;
   config: DdiConfig;
+  /** D3B commercial activation. Absent means the commercial routes fail closed with 503. */
+  commercial?: CommercialApi;
   database?: () => Promise<"UP" | "DOWN" | "UNCONFIGURED">;
   identity?: () => Promise<"CONNECTED" | "DEGRADED" | "UNAVAILABLE">;
 };
@@ -76,7 +80,7 @@ export function resultStatus(status: CapabilityResult["status"]) {
   return 400;
 }
 
-export function buildApi({ service, config, database = async () => "UNCONFIGURED", identity = async () => "CONNECTED" }: Deps) {
+export function buildApi({ service, config, commercial, database = async () => "UNCONFIGURED", identity = async () => "CONNECTED" }: Deps) {
   const app = Fastify({ logger: false });
   const actorFrom = async (header: string | undefined) => header?.startsWith("Bearer ") ? service.authenticate(header.slice(7)) : null;
   const applicationFrom = async (header: string | undefined) => header?.startsWith("Application ") ? service.authenticateApplication(header.slice("Application ".length)) : null;
@@ -252,5 +256,6 @@ export function buildApi({ service, config, database = async () => "UNCONFIGURED
       return reply.code(resultStatus(result.status)).send(result);
     } catch { return reply.code(503).send({ code: "UNAVAILABLE" }); }
   });
+  registerCommercialRoutes(app, { commercial, actorFrom, applicationFrom, getInfrastructure: id => service.getInfrastructure(id), distributorSecret: config.downloadDistributorSecret });
   return app;
 }

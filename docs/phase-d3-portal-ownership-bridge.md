@@ -29,7 +29,9 @@ owner constraint and only connects verified properties to that PDI.
 
 ## Remaining D3 work before staging
 
-Commercial activation is **not implemented** by this bridge. Existing Portal
+Commercial activation is **not implemented** by this bridge; it is built in
+Phase D3B (`docs/phase-d3b-commercial-activation.md`), which also adds the
+bridge's `bootstrap` purpose. Existing Portal
 `PortalBilling` records prove the current Finprove checkout/install flow only;
 they do not satisfy D3 activation-code requirements. A staging candidate needs
 a durable, PostgreSQL-atomic activation-code/entitlement/outbox model with
