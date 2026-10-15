@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PORTAL_SHA: 5d756c46f38c3cb085b594af04adf8d996f180c3
+  PORTAL_SHA: af68cae1bd656ec6b202df48ebc868182ce4e0fb
   MD_SHA: e46366696e1b75062dde0a27fa8dca0074ef724c
   TRUSTID_SHA: 8bf7852d14fe91ba28670768c7f3b2c898ce581b
   ELFCOM_SHA: f0b7e7213e4b0c8bf0efe560212ec1cd3764bdbf
