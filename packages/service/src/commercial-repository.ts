@@ -9,7 +9,7 @@ type LicenseRow = { id: string; entitlement_id: string; owner_id: string; infras
 type RedemptionRow = { id: string; code_id: string; owner_id: string; owner_trust_subject: string | null; idempotency_key: string; infrastructure_id: string; property_id: string | null; entitlement_id: string; license_id: string; status: RedemptionStatus; provisioning_reference: string | null; provisioned_at: Date | null; activated_at: Date | null; last_error: string | null; created_at: Date; updated_at: Date };
 type PropertyRow = { id: string; infrastructure_id: string; owner_id: string; property_type: ConnectedPropertyType; external_system: string; external_reference: string; display_name: string; status: ConnectedProperty["status"]; ownership_evidence: string; created_at: Date; updated_at: Date; revoked_at: Date | null };
 export type OutboxJob = { id: string; kind: string; aggregateId: string; payload: { redemptionId: string }; attempts: number; maxAttempts: number; leaseToken: string };
-export type DownloadGrantRow = { id: string; owner_id: string; license_id: string; entitlement_id: string; product_id: string; artifact_id: string; property_id: string | null; status: "ISSUED" | "CONSUMED"; expires_at: Date; consumed_at: Date | null };
+export type DownloadGrantRow = { id: string; owner_id: string; license_id: string; entitlement_id: string; product_id: string; artifact_id: string; artifact_version: string | null; property_id: string | null; status: "ISSUED" | "CONSUMED"; expires_at: Date; consumed_at: Date | null };
 export type LifecycleAction = "SUSPEND" | "REINSTATE" | "REVOKE";
 
 const CODE_COLUMNS = "id, lookup_id, secret_hash, product_id, plan_id, plan_snapshot, catalog_version, payment_reference, issued_by, status, created_at, expires_at, redeemed_by_owner_id, redeemed_at, redemption_id, revoked_at";
@@ -383,18 +383,18 @@ export class PostgresCommercialRepository {
   }
 
   /* Download grants */
-  async insertDownloadGrant(input: { tokenHash: string; ownerId: string; license: License; artifactId: string; expiresAt: Date; at: Date; correlationId: string }) {
+  async insertDownloadGrant(input: { tokenHash: string; ownerId: string; license: License; artifactId: string; version?: string; expiresAt: Date; at: Date; correlationId: string }) {
     const id = `dlgrant:${randomUUID()}`;
     await this.transaction(async client => {
-      await client.query(`INSERT INTO ddi_download_grants (id, token_hash, owner_id, license_id, entitlement_id, product_id, artifact_id, property_id, status, expires_at, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ISSUED',$9,$10)`, [id, input.tokenHash, input.ownerId, input.license.id, input.license.entitlementId, input.license.productId, input.artifactId, input.license.propertyId ?? null, iso(input.expiresAt), iso(input.at)]);
-      await this.audit({ eventType: "DOWNLOAD_AUTHORIZED", correlationId: input.correlationId, actor: `owner:${input.ownerId}`, ownerId: input.ownerId as DigiOwnerId, licenseId: input.license.id, entitlementId: input.license.entitlementId, propertyId: input.license.propertyId, productId: input.license.productId, result: "ISSUED", reason: `artifact:${input.artifactId}`, timestamp: iso(input.at) }, client);
+      await client.query(`INSERT INTO ddi_download_grants (id, token_hash, owner_id, license_id, entitlement_id, product_id, artifact_id, artifact_version, property_id, status, expires_at, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ISSUED',$10,$11)`, [id, input.tokenHash, input.ownerId, input.license.id, input.license.entitlementId, input.license.productId, input.artifactId, input.version ?? null, input.license.propertyId ?? null, iso(input.expiresAt), iso(input.at)]);
+      await this.audit({ eventType: "DOWNLOAD_AUTHORIZED", correlationId: input.correlationId, actor: `owner:${input.ownerId}`, ownerId: input.ownerId as DigiOwnerId, licenseId: input.license.id, entitlementId: input.license.entitlementId, propertyId: input.license.propertyId, productId: input.license.productId, result: "ISSUED", reason: `artifact:${input.artifactId}${input.version ? `@${input.version}` : ""}`, timestamp: iso(input.at) }, client);
     });
     return id;
   }
   /** Single-use consumption under a row lock. The license is re-evaluated while the grant is held. */
   async consumeDownloadGrant(tokenHash: string, at: Date, check: (grant: DownloadGrantRow) => Promise<string | null>): Promise<{ ok: true; grant: DownloadGrantRow } | { ok: false; reason: string; grant?: DownloadGrantRow }> {
     return this.transaction(async client => {
-      const result = await client.query<DownloadGrantRow>(`SELECT id, owner_id, license_id, entitlement_id, product_id, artifact_id, property_id, status, expires_at, consumed_at FROM ddi_download_grants WHERE token_hash = $1 FOR UPDATE`, [tokenHash]);
+      const result = await client.query<DownloadGrantRow>(`SELECT id, owner_id, license_id, entitlement_id, product_id, artifact_id, artifact_version, property_id, status, expires_at, consumed_at FROM ddi_download_grants WHERE token_hash = $1 FOR UPDATE`, [tokenHash]);
       const grant = result.rows[0];
       if (!grant) return { ok: false, reason: "DOWNLOAD_GRANT_INVALID" };
       if (grant.status !== "ISSUED") return { ok: false, reason: "DOWNLOAD_GRANT_CONSUMED", grant };

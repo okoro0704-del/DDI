@@ -13,6 +13,7 @@ import type { OwnershipRequest, OwnershipVerification, OwnershipVerifier } from 
 import { migrate } from "../packages/service/src/postgres.ts";
 import { PostgresDdiRepository } from "../packages/service/src/postgres-repository.ts";
 import { DurableDdiService, defaultAdapters } from "../packages/service/src/runtime.ts";
+import { testServiceIdentity } from "./helpers/service-keys.ts";
 
 /*
  * D3C-A integration readiness.
@@ -24,7 +25,7 @@ import { DurableDdiService, defaultAdapters } from "../packages/service/src/runt
 const databaseUrl = process.env.DDI_TEST_DATABASE_URL ?? "";
 const schema = "ddi_commercial_integration";
 const PEPPER = "d3c-test-pepper-0123456789abcdefghijklmnop";
-const DISTRIBUTOR_SECRET = "d3c-test-distributor-secret-0123456789abcdef";
+const distributorIdentity = testServiceIdentity("master-distributor");
 const START = Date.parse("2026-10-16T09:00:00.000Z");
 const catalog = parseCatalog({
   version: "d3c-test",
@@ -79,7 +80,7 @@ class MasterDistributorDouble {
   constructor(ddiBase: () => string) { this.ddiBase = ddiBase; }
   async fulfill(input: { token: string; artifactId: string; propertyId?: string }) {
     if (this.down) throw new Error("DISTRIBUTOR_UNAVAILABLE");
-    const response = await fetch(new URL("/internal/downloads/redeem", this.ddiBase()), { method: "POST", headers: { "content-type": "application/json", "x-ddi-distributor-secret": DISTRIBUTOR_SECRET, "x-correlation-id": `md-${input.artifactId}` }, body: JSON.stringify({ token: input.token, artifactId: input.artifactId, propertyId: input.propertyId }) });
+    const response = await fetch(new URL("/internal/downloads/redeem", this.ddiBase()), { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${distributorIdentity.token("ddi", "POST", "/internal/downloads/redeem")}`, "x-correlation-id": `md-${input.artifactId}` }, body: JSON.stringify({ token: input.token, artifactId: input.artifactId, version: "1.4.0", propertyId: input.propertyId }) });
     const body = await response.json() as { code?: string; artifactId?: string; ownerId?: string };
     if (!response.ok) return { status: response.status, code: body.code };
     const artifact = this.registry.get(body.artifactId!);
@@ -124,14 +125,14 @@ describe("D3C-A Portal x Master Distributor integration readiness", { concurrenc
     await bootstrap.query(`CREATE SCHEMA ${schema}`);
     await bootstrap.end();
     pool = new Pool({ connectionString: databaseUrl, max: 16, options: `-c search_path=${schema}` });
-    for (const migration of ["001_ddi_foundation.sql", "002_ddi_runtime.sql", "003_pdi_connections.sql", "004_connected_properties.sql", "005_commercial_activation.sql", "006_commercial_recovery.sql"]) await migrate(pool, join("migrations", migration));
+    for (const migration of ["001_ddi_foundation.sql", "002_ddi_runtime.sql", "003_pdi_connections.sql", "004_connected_properties.sql", "005_commercial_activation.sql", "006_commercial_recovery.sql", "007_portal_install_state.sql", "008_download_grant_version.sql"]) await migrate(pool, join("migrations", migration));
     ddi = new PostgresDdiRepository(pool);
     repository = new PostgresCommercialRepository(pool);
     await repository.setOperator(admin, "COMMERCIAL_ADMIN", "test-bootstrap", new Date(START));
     commercial = new CommercialService({ repository, pdi: ddi, ownership, provisioner: provisioning, catalog, pepper: PEPPER, clock: () => new Date(now), downloadTtlSeconds: 60, outbox: { baseDelayMs: 1_000, maxDelayMs: 10_000, leaseMs: 20_000, maxAttempts: 3 } });
     const sessionClient: DigiSessionClient = { async resolve(token) { return sessions.get(token) ?? null; } };
     const service = new DurableDdiService(ddi, async () => ({ ok: false, reason: "MISSING" }), defaultAdapters(async () => null), sessionClient);
-    const api = buildApi({ service, commercial, config: { ...readConfig({ DDI_ENV: "test" }), downloadDistributorSecret: DISTRIBUTOR_SECRET } });
+    const api = buildApi({ service, commercial, config: { ...readConfig({ DDI_ENV: "test" }), trustedServices: { "master-distributor": distributorIdentity.trusted(["downloads:redeem"]) } } });
     ddiBase = await api.listen({ port: 0, host: "127.0.0.1" });
     closeApi = () => api.close();
   });
@@ -216,7 +217,7 @@ describe("D3C-A Portal x Master Distributor integration readiness", { concurrenc
     const { id, propertyId, licenseId, infrastructureId } = pending.body.redemption;
     assert.equal((await ddi.getProperty(propertyId))?.status, "PENDING_ACTIVATION");
     // No privilege before activation: no download, no property application, no license validity.
-    assert.equal((await call("POST", `/me/licenses/${licenseId}/downloads`, session(owner), { artifactId: "personal-brandos.apk" })).body.code, "PROPERTY_NOT_ACTIVE");
+    assert.equal((await call("POST", `/me/licenses/${licenseId}/downloads`, session(owner), { artifactId: "personal-brandos.apk", version: "1.4.0" })).body.code, "PROPERTY_NOT_ACTIVE");
     await assert.rejects(ddi.registerApplication(owner as DigiOwnerId, infrastructureId, { type: "WEB", displayName: "early", propertyId, capabilities: [], idempotencyKey: "handover-app" }), /PROPERTY_NOT_ACTIVE/);
     assert.equal((await call("GET", `/me/licenses/${licenseId}`, session(owner))).body.valid, false);
     // The Portal install changes hands and becomes READY for someone else.
@@ -244,7 +245,7 @@ describe("D3C-A Portal x Master Distributor integration readiness", { concurrenc
     ownership.set("download-b", `TD-${owner}`, "ready");
     const a = (await redeem(owner, "download-a", "download-a")).body.redemption;
     const b = (await redeem(owner, "download-b", "download-b")).body.redemption;
-    const grant = async (licenseId: string, artifactId = "personal-brandos.apk") => call("POST", `/me/licenses/${licenseId}/downloads`, session(owner), { artifactId });
+    const grant = async (licenseId: string, artifactId = "personal-brandos.apk") => call("POST", `/me/licenses/${licenseId}/downloads`, session(owner), { artifactId, version: "1.4.0" });
     // 13: artifact mismatch does not consume; the right artifact then succeeds.
     const g1 = (await grant(a.licenseId)).body;
     assert.equal((await distributor.fulfill({ token: g1.token, artifactId: "personal-brandos.web" })).code, "DOWNLOAD_SCOPE_MISMATCH");
@@ -263,7 +264,7 @@ describe("D3C-A Portal x Master Distributor integration readiness", { concurrenc
     assert.deepEqual(crossProperty.body, { valid: false, reason: "PROPERTY_MISMATCH" });
     assert.equal((await call("POST", "/licenses/verify", `Application ${appB.applicationCredential}`, { licenseId: b.licenseId })).body.valid, true);
     // 10: cross-owner.
-    assert.equal((await call("POST", `/me/licenses/${a.licenseId}/downloads`, session(other), { artifactId: "personal-brandos.apk" })).status, 404);
+    assert.equal((await call("POST", `/me/licenses/${a.licenseId}/downloads`, session(other), { artifactId: "personal-brandos.apk", version: "1.4.0" })).status, 404);
     // 12: distributor outage consumes nothing; the grant simply expires and a fresh one works later.
     const g2 = (await grant(a.licenseId)).body;
     distributor.down = true;
@@ -278,8 +279,9 @@ describe("D3C-A Portal x Master Distributor integration readiness", { concurrenc
     assert.equal((await call("POST", `/admin/commercial/licenses/${a.licenseId}/revoke`, session(admin), { reason: "refund" })).status, 200);
     assert.equal((await distributor.fulfill({ token: g3.token, artifactId: "personal-brandos.apk" })).code, "LICENSE_REVOKED");
     // A forged distributor credential is refused before any grant lookup.
-    const forged = await fetch(new URL("/internal/downloads/redeem", ddiBase), { method: "POST", headers: { "content-type": "application/json", "x-ddi-distributor-secret": "forged" }, body: JSON.stringify({ token: g3.token, artifactId: "personal-brandos.apk" }) });
-    assert.equal(forged.status, 403);
+    const forged = await fetch(new URL("/internal/downloads/redeem", ddiBase), { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${testServiceIdentity("master-distributor").token("ddi", "POST", "/internal/downloads/redeem")}` }, body: JSON.stringify({ token: g3.token, artifactId: "personal-brandos.apk", version: "1.4.0" }) });
+    // Same service id, but a key DDI never pinned: rejected.
+    assert.equal(forged.status, 401);
   });
 
   test("14: operator requeue is authorized, audited, bounded, restart-safe and creates nothing new", async () => {

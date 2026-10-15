@@ -12,7 +12,7 @@ import type { DdiRepository } from "./repository.ts";
  * PROVISIONING_REJECTED for a terminal refusal. It conveys commercial
  * authorization only; it never grants a DDI capability.
  */
-export type ProvisioningRequest = { idempotencyKey: string; redemptionId: string; ownerId: string; infrastructureId: string; propertyId?: string; externalSystem?: string; externalReference?: string; productId: string; planId: string; entitlementId: string; licenseId: string };
+export type ProvisioningRequest = { idempotencyKey: string; redemptionId: string; ownerId: string; infrastructureId: string; propertyId?: string; externalSystem?: string; externalReference?: string; productId: string; planId: string; entitlementId: string; licenseId: string; ownerSubject?: string };
 export type CommercialProvisioner = { provision(input: ProvisioningRequest): Promise<{ reference: string }> };
 
 /** No verified provisioning endpoint exists yet. Jobs remain durably pending rather than reporting success. */
@@ -214,7 +214,8 @@ export class CommercialService {
   }
 
   /** Short-lived, single-use, artifact-scoped authorization. No storage URL is ever issued here. */
-  async authorizeDownload(actor: Actor | null | undefined, licenseId: string, artifactId: unknown, correlationId: string) {
+  /** `version` binds the grant to one exact release; the distributor can only fulfil that version. */
+  async authorizeDownload(actor: Actor | null | undefined, licenseId: string, artifactId: unknown, correlationId: string, version?: unknown) {
     const ownerId = this.owner(actor);
     const at = this.now();
     const deny = async (reason: string, license?: License): Promise<never> => {
@@ -222,23 +223,26 @@ export class CommercialService {
       throw new Error(reason);
     };
     if (typeof artifactId !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(artifactId)) return deny("INVALID_REQUEST");
+    if (version !== undefined && (typeof version !== "string" || !/^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(version))) return deny("INVALID_REQUEST");
     const verification = await this.verifyLicense(licenseId, { ownerId });
     if (!verification.valid) return deny(verification.reason);
     if (!verification.entitlement.downloads.includes(artifactId)) return deny("DOWNLOAD_NOT_ENTITLED", verification.license);
     const ttl = Math.min(Math.max(this.options.downloadTtlSeconds ?? 300, 30), 900);
     const expiresAt = new Date(at.getTime() + ttl * 1000);
     const { token, hash } = generateDownloadToken();
-    const grantId = await this.repository.insertDownloadGrant({ tokenHash: hash, ownerId, license: verification.license, artifactId, expiresAt, at, correlationId });
-    return { grantId, token, artifactId, productId: verification.license.productId, licenseId: verification.license.id, expiresAt: expiresAt.toISOString() };
+    const grantId = await this.repository.insertDownloadGrant({ tokenHash: hash, ownerId, license: verification.license, artifactId, version: version as string | undefined, expiresAt, at, correlationId });
+    return { grantId, token, artifactId, version: version as string | undefined, productId: verification.license.productId, licenseId: verification.license.id, expiresAt: expiresAt.toISOString() };
   }
 
   /** Called by the authenticated distributor at delivery time. Revocation or expiry after issuance still denies. */
-  async redeemDownload(token: unknown, expected: { artifactId: unknown; productId?: unknown; propertyId?: unknown }, correlationId: string) {
+  async redeemDownload(token: unknown, expected: { artifactId: unknown; productId?: unknown; propertyId?: unknown; version?: unknown }, correlationId: string) {
     const at = this.now();
     if (typeof token !== "string" || !token.startsWith("ddidl_") || token.length > 100 || typeof expected.artifactId !== "string") throw new Error("DOWNLOAD_GRANT_INVALID");
     const outcome = await this.repository.consumeDownloadGrant(hashDownloadToken(token), at, async grant => {
       // A distributor fulfilling for one property cannot spend a grant scoped to another (or to none).
       if (grant.artifact_id !== expected.artifactId || (expected.productId !== undefined && grant.product_id !== expected.productId) || (expected.propertyId !== undefined && grant.property_id !== expected.propertyId)) return "DOWNLOAD_SCOPE_MISMATCH";
+      // Exact version binding: a pinned grant needs the same version; an unpinned (legacy) grant cannot be fulfilled for any version.
+      if ((grant.artifact_version ?? undefined) !== (expected.version ?? undefined)) return "DOWNLOAD_SCOPE_MISMATCH";
       const verification = await this.verifyLicense(grant.license_id, { ownerId: grant.owner_id, productId: grant.product_id, propertyId: grant.property_id });
       if (!verification.valid) return verification.reason;
       return verification.entitlement.downloads.includes(grant.artifact_id) ? null : "DOWNLOAD_NOT_ENTITLED";
@@ -246,7 +250,7 @@ export class CommercialService {
     const grant = outcome.grant;
     await this.repository.audit({ eventType: outcome.ok ? "DOWNLOAD_REDEEMED" : "DOWNLOAD_DENIED", correlationId, actor: "service:distributor", ownerId: grant?.owner_id as DigiOwnerId | undefined, licenseId: grant?.license_id as License["id"] | undefined, entitlementId: grant?.entitlement_id as License["entitlementId"] | undefined, propertyId: (grant?.property_id ?? undefined) as License["propertyId"], productId: grant?.product_id, result: outcome.ok ? "CONSUMED" : "DENIED", reason: outcome.ok ? `artifact:${grant!.artifact_id}` : outcome.reason, timestamp: at.toISOString() }).catch(() => undefined);
     if (!outcome.ok) throw new Error(outcome.reason);
-    return { ownerId: outcome.grant.owner_id, licenseId: outcome.grant.license_id, productId: outcome.grant.product_id, artifactId: outcome.grant.artifact_id, propertyId: outcome.grant.property_id ?? undefined };
+    return { ownerId: outcome.grant.owner_id, licenseId: outcome.grant.license_id, productId: outcome.grant.product_id, artifactId: outcome.grant.artifact_id, version: outcome.grant.artifact_version ?? undefined, propertyId: outcome.grant.property_id ?? undefined };
   }
 
   async getRedemptionDetail(actor: Actor | null | undefined, id: string) {
@@ -317,7 +321,7 @@ export class CommercialService {
     let terminal: string | undefined;
     if (!redemption.provisionedAt) {
       try {
-        const provisioned = await this.options.provisioner.provision({ idempotencyKey: `ddi-provision:${redemption.id}`, redemptionId: redemption.id, ownerId: redemption.ownerId, infrastructureId: redemption.infrastructureId, propertyId: redemption.propertyId, externalSystem: property?.externalSystem, externalReference: property?.externalReference, productId: license.productId, planId: license.planId, entitlementId: license.entitlementId, licenseId: license.id });
+        const provisioned = await this.options.provisioner.provision({ idempotencyKey: `ddi-provision:${redemption.id}`, redemptionId: redemption.id, ownerId: redemption.ownerId, infrastructureId: redemption.infrastructureId, propertyId: redemption.propertyId, externalSystem: property?.externalSystem, externalReference: property?.externalReference, productId: license.productId, planId: license.planId, entitlementId: license.entitlementId, licenseId: license.id, ownerSubject: trustSubject });
         if (typeof provisioned?.reference !== "string" || !provisioned.reference) throw new Error("PROVISIONING_UNAVAILABLE");
         await this.repository.markProvisioned(redemption.id, provisioned.reference, this.now(), correlationId);
       } catch (error) {
@@ -345,6 +349,8 @@ export class CommercialService {
           }
         }
       } else if (property.status === "ACTIVE") await this.repository.activateProperty(redemption.id, this.now(), correlationId);
+      // Suspended by the Portal: wait (bounded) for a sequenced reinstatement; never activate meanwhile.
+      else if (property.status === "SUSPENDED") retryable.push("PROPERTY_SUSPENDED");
       else terminal = "PROPERTY_NOT_ACTIVATABLE";
     }
     if (terminal) {

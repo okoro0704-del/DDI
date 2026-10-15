@@ -8,6 +8,8 @@ import { HttpPortalOwnershipVerifier } from "../../../packages/service/src/owner
 import { CommercialService, UnavailableCommercialProvisioner } from "../../../packages/service/src/commercial.ts";
 import { loadCatalog } from "../../../packages/service/src/commercial-catalog.ts";
 import { PostgresCommercialRepository } from "../../../packages/service/src/commercial-repository.ts";
+import { PostgresPortalInstallState } from "../../../packages/service/src/portal-install-state.ts";
+import { HttpPortalProvisioner } from "../../../packages/service/src/portal-provisioner.ts";
 import { CanonicalTrustIdVerifier } from "../../../packages/service/src/trustid.ts";
 import { buildApi } from "./app.ts";
 
@@ -26,7 +28,8 @@ export async function composeRuntime(env: NodeJS.ProcessEnv = process.env) {
   }
   const identityVerifier = new CanonicalTrustIdVerifier({ issuer: config.trustIdIssuer, audience: config.trustIdAudience, jwksUrl: config.trustIdJwksUrl, bridgeModuleUrl: config.trustIdBridgeModuleUrl });
   const repository = new PostgresDdiRepository(pool);
-  const ownership = new HttpPortalOwnershipVerifier({ url: config.portalOwnershipUrl!, sharedSecret: config.portalOwnershipSharedSecret! });
+  // With a DDI service identity the Portal call carries a service token; otherwise the D3A shared secret.
+  const ownership = new HttpPortalOwnershipVerifier({ url: config.portalOwnershipUrl!, sharedSecret: config.portalOwnershipSharedSecret, signer: config.serviceSigner });
   const service = new DurableDdiService(
     repository,
     authorityVerifier(new HttpDigiAuthorityClient({ consumeUrl: new URL("/v1/authority/consume", config.digiAuthorityUrl).href, jwksUrl: config.digiAuthorityJwksUrl, verifierModuleUrl: config.digiAuthorityVerifierModuleUrl })),
@@ -35,8 +38,13 @@ export async function composeRuntime(env: NodeJS.ProcessEnv = process.env) {
     new HttpDigiAuthorityGrantClient(config.digiAuthorityUrl),
     ownership,
   );
-  // No verified Portal/Master Distributor provisioning endpoint exists yet: provisioning stays durably pending.
-  const commercial = catalog ? new CommercialService({ repository: new PostgresCommercialRepository(pool), pdi: repository, ownership, provisioner: new UnavailableCommercialProvisioner(), catalog, pepper: config.activationCodePepper!, downloadTtlSeconds: config.downloadGrantTtlSeconds }) : undefined;
-  const app = buildApi({ service, config, commercial, database: () => postgresHealth(pool), identity: () => identityVerifier.health() });
-  return { app, pool, config, service, commercial };
+  // Production keeps the always-unavailable provisioner. readConfig refuses the Portal adapter in production;
+  // it is enabled only by an explicit local-integration mode with a DDI service identity.
+  const provisioner = config.provisioningMode === "portal-local-integration" && config.environment !== "production"
+    ? new HttpPortalProvisioner({ url: config.portalProvisioningUrl!, signer: config.serviceSigner! })
+    : new UnavailableCommercialProvisioner();
+  const commercial = catalog ? new CommercialService({ repository: new PostgresCommercialRepository(pool), pdi: repository, ownership, provisioner, catalog, pepper: config.activationCodePepper!, downloadTtlSeconds: config.downloadGrantTtlSeconds }) : undefined;
+  const installState = new PostgresPortalInstallState(pool);
+  const app = buildApi({ service, config, commercial, installState, database: () => postgresHealth(pool), identity: () => identityVerifier.health() });
+  return { app, pool, config, service, commercial, installState, ownership };
 }

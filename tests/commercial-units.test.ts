@@ -5,6 +5,7 @@ import { CommercialService, UnavailableCommercialProvisioner } from "../packages
 import { loadCatalog, parseCatalog } from "../packages/service/src/commercial-catalog.ts";
 import { readConfig } from "../packages/service/src/config.ts";
 import { HttpPortalOwnershipVerifier } from "../packages/service/src/ownership.ts";
+import { testServiceIdentity } from "./helpers/service-keys.ts";
 
 const plan = { id: "plan", edition: "standard", licenseType: "PERPETUAL", renewable: false, requiresProperty: false, propertyTypes: [], downloads: ["artifact"] };
 const catalog = (patch: Record<string, unknown> = {}) => ({ version: "v1", products: [{ id: "product", displayName: "Product", plans: [{ ...plan, ...patch }] }] });
@@ -52,7 +53,14 @@ test("production refuses a commercial catalog without a strong pepper or with a 
   assert.throws(() => readConfig({ ...base, DDI_COMMERCIAL_CATALOG: JSON.stringify(catalog()) }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
   assert.throws(() => readConfig({ ...base, DDI_COMMERCIAL_CATALOG: JSON.stringify(catalog()), DDI_ACTIVATION_CODE_PEPPER: "too-short" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
   assert.doesNotThrow(() => readConfig({ ...base, DDI_COMMERCIAL_CATALOG: JSON.stringify(catalog()), DDI_ACTIVATION_CODE_PEPPER: "x".repeat(32) }));
-  assert.throws(() => readConfig({ ...base, DDI_DOWNLOAD_DISTRIBUTOR_SECRET: "weak" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
+  // D3C-B: test-labelled service keys and the local-integration provisioning adapter are refused in production.
+  const md = testServiceIdentity("master-distributor");
+  const trusted = JSON.stringify({ "master-distributor": { permissions: ["downloads:redeem"], keys: { [md.keyId]: md.publicKeyPem } } });
+  assert.doesNotThrow(() => readConfig({ DDI_ENV: "test", DDI_TRUSTED_SERVICES: trusted }));
+  assert.throws(() => readConfig({ ...base, DDI_TRUSTED_SERVICES: trusted }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
+  assert.throws(() => readConfig({ ...base, DDI_COMMERCIAL_PROVISIONING_MODE: "portal-local-integration", PORTAL_PROVISIONING_URL: "https://p/x" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
+  assert.throws(() => readConfig({ DDI_ENV: "test", DDI_COMMERCIAL_PROVISIONING_MODE: "portal-local-integration" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
+  assert.throws(() => readConfig({ DDI_ENV: "test", DDI_COMMERCIAL_PROVISIONING_MODE: "always-succeed" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
 });
 
 test("Portal ownership: BOOTSTRAP accepts a verified owner of a pending install; ACTIVATE requires READY", async () => {

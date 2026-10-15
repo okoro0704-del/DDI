@@ -1,8 +1,9 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { Actor, ApplicationRecord, InfrastructureRecord } from "../../../packages/contracts/src/index.ts";
 import type { CommercialService } from "../../../packages/service/src/commercial.ts";
 import type { LifecycleAction } from "../../../packages/service/src/commercial-repository.ts";
+import { bearer, type ServiceTokenVerifier } from "../../../packages/service/src/service-token.ts";
 
 export type CommercialApi = Pick<CommercialService, "issueCode" | "revokeCode" | "getCode" | "redeem" | "getRedemption" | "listEntitlements" | "listLicenses" | "getLicense" | "verifyLicense" | "changeLicense" | "changeEntitlement" | "authorizeDownload" | "redeemDownload" | "runOutboxAsOperator" | "getRedemptionDetail" | "requeueRedemption">;
 
@@ -14,7 +15,7 @@ export const commercialRouteInventory = [
   { method: "GET", url: "/me/licenses/:id", access: "AUTHENTICATED_OWNER_COMMERCIAL" },
   { method: "POST", url: "/me/licenses/:id/downloads", access: "AUTHENTICATED_OWNER_COMMERCIAL" },
   { method: "POST", url: "/licenses/verify", access: "APPLICATION_AUTHENTICATED" },
-  { method: "POST", url: "/internal/downloads/redeem", access: "DISTRIBUTOR_SERVICE_CREDENTIAL" },
+  { method: "POST", url: "/internal/downloads/redeem", access: "SERVICE_TOKEN:downloads:redeem" },
   { method: "POST", url: "/admin/commercial/activation-codes", access: "COMMERCIAL_OPERATOR" },
   { method: "GET", url: "/admin/commercial/activation-codes/:id", access: "COMMERCIAL_OPERATOR" },
   { method: "POST", url: "/admin/commercial/activation-codes/:id/revoke", access: "COMMERCIAL_OPERATOR" },
@@ -41,13 +42,6 @@ function failure(reply: FastifyReply, error: unknown) {
   return reply.code(STATUS[code] ?? 400).header("cache-control", "no-store").send({ code });
 }
 
-function sameSecret(actual: unknown, expected: string | undefined) {
-  if (typeof actual !== "string" || !expected) return false;
-  const left = Buffer.from(actual);
-  const right = Buffer.from(expected);
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
 const ACTIONS: Record<string, LifecycleAction> = { suspend: "SUSPEND", reinstate: "REINSTATE", revoke: "REVOKE" };
 
 /**
@@ -60,7 +54,8 @@ export function registerCommercialRoutes(app: FastifyInstance, deps: {
   actorFrom(header: string | undefined): Promise<Actor | null>;
   applicationFrom(header: string | undefined): Promise<ApplicationRecord | null>;
   getInfrastructure(id: string): Promise<InfrastructureRecord | null>;
-  distributorSecret?: string;
+  /** D3C-B: Ed25519 service tokens; the distributor's permission comes from DDI's trust config, never the token. */
+  serviceAuth?: ServiceTokenVerifier;
 }) {
   const correlation = (request: FastifyRequest) => String(request.headers["x-correlation-id"] ?? randomUUID()).slice(0, 128);
   const owner = async (request: FastifyRequest, reply: FastifyReply) => {
@@ -112,7 +107,10 @@ export function registerCommercialRoutes(app: FastifyInstance, deps: {
   app.post("/me/licenses/:id/downloads", async (request, reply) => {
     const context = await owner(request, reply);
     if (!context) return reply;
-    try { return reply.header("cache-control", "no-store").send(await context.commercial.authorizeDownload(context.actor, id(request), (request.body as { artifactId?: unknown } | undefined)?.artifactId, correlation(request))); }
+    const body = request.body as { artifactId?: unknown; version?: unknown } | undefined;
+    // Over HTTP a grant always names an exact version (distributor contract ddi-grants v1).
+    if (typeof body?.version !== "string") return reply.code(400).send({ code: "VERSION_REQUIRED" });
+    try { return reply.header("cache-control", "no-store").send(await context.commercial.authorizeDownload(context.actor, id(request), body.artifactId, correlation(request), body.version)); }
     catch (error) { return failure(reply, error); }
   });
 
@@ -130,10 +128,12 @@ export function registerCommercialRoutes(app: FastifyInstance, deps: {
   });
 
   app.post("/internal/downloads/redeem", async (request, reply) => {
-    if (!deps.commercial || !deps.distributorSecret) return reply.code(503).send({ code: "COMMERCIAL_UNAVAILABLE" });
-    if (!sameSecret(request.headers["x-ddi-distributor-secret"], deps.distributorSecret)) return reply.code(403).send({ code: "FORBIDDEN" });
-    const body = request.body as { token?: unknown; artifactId?: unknown; productId?: unknown; propertyId?: unknown } | undefined;
-    try { return await deps.commercial.redeemDownload(body?.token, { artifactId: body?.artifactId, productId: body?.productId, propertyId: body?.propertyId }, correlation(request)); }
+    if (!deps.commercial || !deps.serviceAuth) return reply.code(503).send({ code: "COMMERCIAL_UNAVAILABLE" });
+    const caller = deps.serviceAuth.verify(bearer(request.headers.authorization), { method: "POST", path: "/internal/downloads/redeem" });
+    if (!caller) return reply.code(401).send({ code: "SERVICE_AUTHENTICATION_REQUIRED" });
+    if (!caller.permissions.includes("downloads:redeem")) return reply.code(403).send({ code: "FORBIDDEN" });
+    const body = request.body as { token?: unknown; artifactId?: unknown; productId?: unknown; propertyId?: unknown; version?: unknown } | undefined;
+    try { return await deps.commercial.redeemDownload(body?.token, { artifactId: body?.artifactId, productId: body?.productId, propertyId: body?.propertyId, version: body?.version }, correlation(request)); }
     catch (error) { return failure(reply, error); }
   });
 

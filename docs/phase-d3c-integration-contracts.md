@@ -1,5 +1,9 @@
 # Phase D3C-A — Portal × Master Distributor integration contracts
 
+> **Superseded in part by D3C-B** (`docs/phase-d3c-b-integration.md`): service calls now use Ed25519
+> service tokens instead of shared secrets, Contracts B and D are implemented, download grants bind
+> an exact version, and Portal → DDI install events exist.
+
 Status: **readiness only.** Contracts marked *proposed* have no implementation on
 the other side. DDI production composition keeps `UnavailableCommercialProvisioner`,
 so nothing reports provisioning success until a real Portal endpoint exists.

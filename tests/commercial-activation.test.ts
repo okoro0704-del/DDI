@@ -12,12 +12,14 @@ import { readConfig } from "../packages/service/src/config.ts";
 import type { OwnershipRequest, OwnershipVerification, OwnershipVerifier } from "../packages/service/src/ownership.ts";
 import { migrate } from "../packages/service/src/postgres.ts";
 import { PostgresDdiRepository } from "../packages/service/src/postgres-repository.ts";
+import { testServiceIdentity } from "./helpers/service-keys.ts";
 
 const databaseUrl = process.env.DDI_TEST_DATABASE_URL ?? "";
 const schema = "ddi_commercial";
 const local = (url: string) => ["127.0.0.1", "localhost", "::1"].includes(new URL(url).hostname);
 const PEPPER = "d3b-test-pepper-0123456789abcdefghijklmnop";
-const DISTRIBUTOR_SECRET = "d3b-test-distributor-secret-0123456789abcdef";
+const distributorIdentity = testServiceIdentity("master-distributor");
+const distributorAuth = () => ({ authorization: `Bearer ${distributorIdentity.token("ddi", "POST", "/internal/downloads/redeem")}` });
 const START = Date.parse("2026-10-15T10:00:00.000Z");
 const catalog = parseCatalog({
   version: "test-2026-10-15",
@@ -92,7 +94,7 @@ describe("D3B commercial activation, licensing and property provisioning", { con
     await bootstrap.query(`CREATE SCHEMA ${schema}`);
     await bootstrap.end();
     pool = new Pool({ connectionString: databaseUrl, max: 16, options: `-c search_path=${schema}` });
-    for (const migration of ["001_ddi_foundation.sql", "002_ddi_runtime.sql", "003_pdi_connections.sql", "004_connected_properties.sql", "005_commercial_activation.sql", "006_commercial_recovery.sql"]) await migrate(pool, join("migrations", migration));
+    for (const migration of ["001_ddi_foundation.sql", "002_ddi_runtime.sql", "003_pdi_connections.sql", "004_connected_properties.sql", "005_commercial_activation.sql", "006_commercial_recovery.sql", "007_portal_install_state.sql", "008_download_grant_version.sql"]) await migrate(pool, join("migrations", migration));
     // Migrations are re-runnable without error.
     await migrate(pool, join("migrations", "005_commercial_activation.sql"));
     ddi = new PostgresDdiRepository(pool);
@@ -242,7 +244,7 @@ describe("D3B commercial activation, licensing and property provisioning", { con
     const sessions = new Map<string, Actor>([["session-api", actor("own_d3b_api")], ["session-nobody", actor("own_d3b_api_nobody")], ["session-admin", issuer]]);
     const api = buildApi({
       service: { async authenticate(token: string) { return sessions.get(token) ?? null; }, async authenticateApplication() { return null; }, async getInfrastructure(infrastructureId: string) { return ddi.getInfrastructure(infrastructureId); } } as unknown as DdiApiService,
-      config: { ...readConfig({ DDI_ENV: "test" }), downloadDistributorSecret: DISTRIBUTOR_SECRET },
+      config: { ...readConfig({ DDI_ENV: "test" }), trustedServices: { "master-distributor": distributorIdentity.trusted(["downloads:redeem"]) } },
       commercial: service,
     });
     try {
@@ -263,16 +265,16 @@ describe("D3B commercial activation, licensing and property provisioning", { con
       assert.equal(redeemed.statusCode, 200, redeemed.body);
       assert.equal(redeemed.json().redemption.ownerId, "own_d3b_api");
       const licenseId = redeemed.json().redemption.licenseId;
-      const download = await api.inject({ method: "POST", url: `/me/licenses/${licenseId}/downloads`, headers: { authorization: "Bearer session-api" }, payload: { artifactId: "toolkit-cli" } });
+      const download = await api.inject({ method: "POST", url: `/me/licenses/${licenseId}/downloads`, headers: { authorization: "Bearer session-api" }, payload: { artifactId: "toolkit-cli", version: "1.0.0" } });
       assert.equal(download.statusCode, 200);
-      const crossOwner = await api.inject({ method: "POST", url: `/me/licenses/${licenseId}/downloads`, headers: { authorization: "Bearer session-nobody" }, payload: { artifactId: "toolkit-cli" } });
+      const crossOwner = await api.inject({ method: "POST", url: `/me/licenses/${licenseId}/downloads`, headers: { authorization: "Bearer session-nobody" }, payload: { artifactId: "toolkit-cli", version: "1.0.0" } });
       assert.equal(crossOwner.statusCode, 404);
-      const unauthenticatedDistributor = await api.inject({ method: "POST", url: "/internal/downloads/redeem", headers: { "x-ddi-distributor-secret": "guess" }, payload: { token: download.json().token, artifactId: "toolkit-cli" } });
-      assert.equal(unauthenticatedDistributor.statusCode, 403);
-      const delivered = await api.inject({ method: "POST", url: "/internal/downloads/redeem", headers: { "x-ddi-distributor-secret": DISTRIBUTOR_SECRET }, payload: { token: download.json().token, artifactId: "toolkit-cli" } });
+      const unauthenticatedDistributor = await api.inject({ method: "POST", url: "/internal/downloads/redeem", headers: { authorization: "Bearer guess" }, payload: { token: download.json().token, artifactId: "toolkit-cli", version: "1.0.0" } });
+      assert.equal(unauthenticatedDistributor.statusCode, 401);
+      const delivered = await api.inject({ method: "POST", url: "/internal/downloads/redeem", headers: distributorAuth(), payload: { token: download.json().token, artifactId: "toolkit-cli", version: "1.0.0" } });
       assert.equal(delivered.statusCode, 200);
       assert.equal(delivered.json().ownerId, "own_d3b_api");
-      const reused = await api.inject({ method: "POST", url: "/internal/downloads/redeem", headers: { "x-ddi-distributor-secret": DISTRIBUTOR_SECRET }, payload: { token: download.json().token, artifactId: "toolkit-cli" } });
+      const reused = await api.inject({ method: "POST", url: "/internal/downloads/redeem", headers: distributorAuth(), payload: { token: download.json().token, artifactId: "toolkit-cli", version: "1.0.0" } });
       assert.equal(reused.statusCode, 403);
       assert.equal(reused.json().code, "DOWNLOAD_GRANT_CONSUMED");
     } finally { await api.close(); }
