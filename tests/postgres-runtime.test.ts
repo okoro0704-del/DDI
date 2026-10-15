@@ -47,6 +47,7 @@ describe("DDI postgres runtime", { concurrency: 1 }, () => {
     await migrate(pool, join("migrations", "001_ddi_foundation.sql"));
     await migrate(pool, join("migrations", "002_ddi_runtime.sql"));
     await migrate(pool, join("migrations", "003_pdi_connections.sql"));
+    await migrate(pool, join("migrations", "004_connected_properties.sql"));
     repository = new PostgresDdiRepository(pool);
   });
   after(async () => { await pool?.end(); });

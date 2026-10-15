@@ -54,6 +54,7 @@ describe("DDI reusable authority grant alignment", { concurrency: 1 }, () => {
     await migrate(pool, join("migrations", "001_ddi_foundation.sql"));
     await migrate(pool, join("migrations", "002_ddi_runtime.sql"));
     await migrate(pool, join("migrations", "003_pdi_connections.sql"));
+    await migrate(pool, join("migrations", "004_connected_properties.sql"));
     repository = new PostgresDdiRepository(pool);
     const bridge = await import(pathToFileURL(join(trustRoot, "packages/digi-bridge/dist/index.js")).href) as { openPostgresDigiCore(url: string, options: { schema: string }): Promise<{ owners: unknown; replay: unknown; sessions: unknown; runWrite: unknown; close(): Promise<void> }> };
     const authorityPackage = await import(pathToFileURL(join(trustRoot, "packages/digi-authority/dist/index.js")).href) as { PostgresAuthorityStore: new (url: string) => { close(): Promise<void> } };
@@ -100,19 +101,18 @@ describe("DDI reusable authority grant alignment", { concurrency: 1 }, () => {
     }
     authorityBase = await digi.app.listen({ port: 0, host: "127.0.0.1" });
     closers.push(() => digi.app.close());
-    const grants = new HttpDigiAuthorityGrantClient(authorityBase);
+    // Observe the approval request through the injected client fetch; a later global fetch patch cannot see it.
+    const observingFetch = (async (input: URL | string, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.href;
+      if (url.startsWith(authorityBase) && url.includes("/authority/requests/") && url.endsWith("/approve")) approveBodies.push(String(init?.body ?? ""));
+      return fetch(input, init);
+    });
+    const grants = new HttpDigiAuthorityGrantClient(authorityBase, observingFetch);
     const consume = new HttpDigiAuthorityClient({ consumeUrl: `${authorityBase}/v1/authority/consume`, jwksUrl: `${authorityBase}/.well-known/authority-jwks.json`, verifierModuleUrl: pathToFileURL(join(trustRoot, "packages/authority-verifier/dist/index.js")).href });
     service = new DurableDdiService(repository, authorityVerifier(consume), defaultAdapters(async () => ({ subject: "subject-reusable" })), new HttpDigiSessionClient(authorityBase), grants);
     const api = buildApi({ service, config: readConfig({ DDI_ENV: "test", DDI_ALLOWED_ORIGINS: "https://app.example.test" }) });
     ddiBase = await api.listen({ port: 0, host: "127.0.0.1" });
     closers.push(() => api.close());
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.startsWith(authorityBase) && url.includes("/authority/requests/") && url.endsWith("/approve")) approveBodies.push(String(init?.body ?? ""));
-      return original(input, init);
-    }) as typeof fetch;
-    closers.push(async () => { globalThis.fetch = original; });
   });
 
   after(async () => {

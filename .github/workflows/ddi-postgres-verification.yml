@@ -33,12 +33,15 @@ jobs:
     env:
       DDI_TEST_DATABASE_URL: postgresql://ddi_test:${{ github.run_id }}@127.0.0.1:5432/ddi_test
       DDI_TRUSTID_ROOT: ${{ github.workspace }}/trustid
+      TRUSTID_BRIDGE_MODULE_URL: file://${{ github.workspace }}/trustid/packages/digi-bridge/dist/index.js
+      DIGI_AUTHORITY_VERIFIER_MODULE_URL: file://${{ github.workspace }}/trustid/packages/authority-verifier/dist/index.js
       DDI_ELFCOM_ROOT: ${{ github.workspace }}/elfcom
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
           repository: okoro0704-del/TRUSTID
+          ref: 8bf7852d14fe91ba28670768c7f3b2c898ce581b
           path: trustid
       - uses: actions/checkout@v4
         with:

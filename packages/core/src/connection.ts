@@ -18,12 +18,12 @@ export function describeCapabilities(capabilities: Capability[]) {
 }
 
 /** Explicit Authority binding. The actor key is not the DDI ApplicationId. */
-export function authorityBinding(applicationId: string, infrastructureId: InfrastructureId | string, capability: Capability): Omit<AuthorityGrantRef, "grantId"> {
+export function authorityBinding(applicationId: string, infrastructureId: InfrastructureId | string, capability: Capability, propertyId?: string): Omit<AuthorityGrantRef, "grantId"> {
   return {
     capability,
     actor: `app:${applicationId}`,
     action: capability,
-    resource: `ddi:pdi:${infrastructureId}:${capability}`,
+    resource: propertyId ? `ddi:pdi:${infrastructureId}:property:${propertyId}:${capability}` : `ddi:pdi:${infrastructureId}:${capability}`,
     audience: "ddi",
   };
 }
