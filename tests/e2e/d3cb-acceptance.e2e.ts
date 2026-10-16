@@ -195,7 +195,7 @@ describe("D3C-B acceptance: DDI x Portal x Master Distributor (real local servic
 
     // ---- Master Distributor (real, Postgres + volume storage) ----
     const mdReset = new Pool({ connectionString: mdDb, max: 1 });
-    await mdReset.query("DROP TABLE IF EXISTS md_deliveries, md_uploads, app_latest, app_releases, ssl_certificates, domain_mappings, schema_migrations CASCADE");
+    await mdReset.query("DROP TABLE IF EXISTS md_tenant_bootstraps, md_service_token_replay, md_deliveries, md_uploads, app_latest, app_releases, ssl_certificates, domain_mappings, schema_migrations CASCADE");
     await mdReset.end();
     artifactDir = await mkdtemp(join(tmpdir(), "md-d3cb-"));
     const mdModule = await importFrom(MD_ROOT, "/src/app.ts");
