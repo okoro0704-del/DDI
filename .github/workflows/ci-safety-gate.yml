@@ -38,19 +38,12 @@ jobs:
         with:
           node-version: 22
       - name: Review the pull request's workflows (base-branch gate; pull-request files are data only)
-        run: |
-          set -euo pipefail
-          # A change to this review itself needs a maintainer, not the review it would replace.
-          if ! cmp -s trusted/.github/workflows/ci-safety-gate.yml untrusted/.github/workflows/ci-safety-gate.yml; then
-            echo "::error title=CI safety gate::this pull request changes the trusted safety review; a maintainer must review it"
-            exit 1
-          fi
-          args=()
-          for file in untrusted/.github/workflows/*.yml untrusted/.github/workflows/*.yaml; do
-            [ -f "$file" ] || continue
-            [ "$(basename "$file")" = "ci-safety-gate.yml" ] && continue
-            # Workflows that pull requests can trigger are the ones that run untrusted code.
-            if grep -Eq '^[[:space:]]*pull_request:|^on:.*pull_request([^_]|$)' "$file"; then args+=(--workflow "$file"); fi
-          done
-          if [ "${#args[@]}" -eq 0 ]; then echo "No pull-request workflows to review."; exit 0; fi
-          node trusted/scripts/ci/assert-ci-safety.mjs --static "${args[@]}"
+        # The trusted script parses every pull-request workflow itself (never guessing triggers), reads
+        # each file without following symlinks, requires the runtime gate in every workflow a pull
+        # request can trigger, and refuses changes to this review.
+        run: >-
+          node trusted/scripts/ci/assert-ci-safety.mjs --static
+          --workflows-dir untrusted/.github/workflows
+          --exclude ci-safety-gate.yml
+          --require d3-cross-repo-acceptance.yml
+          --self trusted/.github/workflows/ci-safety-gate.yml
