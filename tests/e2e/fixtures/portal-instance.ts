@@ -8,6 +8,8 @@
  *   READY <base-url>                         listening (the parent then polls GET /health)
  *   BARRIER <tenant-id>                      PORTAL_BARRIER=1: MD succeeded, the Portal has not yet
  *                                            recorded it; the process waits here until it is killed
+ *   BARRIER_COMMIT                           PORTAL_BARRIER=commit (D3D-B1): the ready install is durable,
+ *                                            the install claim is not yet committed; waits until killed
  */
 import { createPrivateKey } from "node:crypto";
 import { join } from "node:path";
@@ -31,11 +33,12 @@ const { openStore } = await importFrom("/apps/portal-api/src/store/open.ts");
 const { buildApp } = await importFrom("/apps/portal-api/src/app.ts");
 const { issuePortalSession } = await importFrom("/apps/portal-api/src/lib/auth.ts");
 const { createRemoteDistributor } = await importFrom("/apps/portal-api/src/services/distributor.ts");
-const { PostgresInstallClaimStore } = await importFrom("/apps/portal-api/src/services/install-claims.ts");
+const { PostgresInstallClaimStore, postgresReadyInstallLookup } = await importFrom("/apps/portal-api/src/services/install-claims.ts");
 
 const signer = { serviceId: "lifeos-portal", keyId: env("PORTAL_KEY_ID"), privateKey: createPrivateKey(env("PORTAL_PRIVATE_KEY_PEM")) };
 const pool = new Pool({ connectionString: databaseUrl, max: 4 });
 const store = await openStore({ databaseUrl });
+const hang = () => new Promise<never>(() => undefined);
 const distributor = createRemoteDistributor({
   signer,
   installClaims: new PostgresInstallClaimStore(pool),
@@ -43,7 +46,14 @@ const distributor = createRemoteDistributor({
   afterBootstrap: process.env.PORTAL_BARRIER === "1"
     ? async (result: { tenantId: string }) => {
         process.stdout.write(`BARRIER ${result.tenantId}\n`);
-        await new Promise(() => undefined);
+        await hang();
+      }
+    : undefined,
+  readyInstalls: postgresReadyInstallLookup(pool),
+  beforeCommit: process.env.PORTAL_BARRIER === "commit"
+    ? async () => {
+        process.stdout.write("BARRIER_COMMIT\n");
+        await hang();
       }
     : undefined,
 });

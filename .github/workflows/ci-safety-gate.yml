@@ -1,0 +1,49 @@
+# Trusted CI safety review of pull requests (D3D-B1, proposed).
+#
+# `pull_request_target` runs THIS file and the gate script from the BASE branch, so a pull request can
+# neither edit nor skip the review that judges it. It never executes pull-request code: the pull
+# request is checked out only as data, nothing from it is installed or run, no pull-request text is
+# interpolated into a shell, the token is read-only and not persisted, and no secrets are referenced.
+#
+# Activation: GitHub only runs it once it is on the pull request's base branch; making it a required
+# status check is a branch-protection setting (separate approval).
+name: CI safety gate (trusted)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: trusted
+          sparse-checkout: |
+            scripts/ci
+            .github/workflows
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: untrusted
+          sparse-checkout: .github/workflows
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Review the pull request's workflows (base-branch gate; pull-request files are data only)
+        # The trusted script parses every pull-request workflow itself (never guessing triggers), reads
+        # each file without following symlinks, requires the runtime gate in every workflow a pull
+        # request can trigger, and refuses changes to this review.
+        run: >-
+          node trusted/scripts/ci/assert-ci-safety.mjs --static
+          --workflows-dir untrusted/.github/workflows
+          --exclude ci-safety-gate.yml
+          --require d3-cross-repo-acceptance.yml
+          --self trusted/.github/workflows/ci-safety-gate.yml
