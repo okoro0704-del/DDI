@@ -1,0 +1,56 @@
+# Trusted CI safety review of pull requests (D3D-B1, proposed).
+#
+# `pull_request_target` runs THIS file and the gate script from the BASE branch, so a pull request can
+# neither edit nor skip the review that judges it. It never executes pull-request code: the pull
+# request is checked out only as data, nothing from it is installed or run, no pull-request text is
+# interpolated into a shell, the token is read-only and not persisted, and no secrets are referenced.
+#
+# Activation: GitHub only runs it once it is on the pull request's base branch; making it a required
+# status check is a branch-protection setting (separate approval).
+name: CI safety gate (trusted)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: trusted
+          sparse-checkout: |
+            scripts/ci
+            .github/workflows
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: untrusted
+          sparse-checkout: .github/workflows
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Review the pull request's workflows (base-branch gate; pull-request files are data only)
+        run: |
+          set -euo pipefail
+          # A change to this review itself needs a maintainer, not the review it would replace.
+          if ! cmp -s trusted/.github/workflows/ci-safety-gate.yml untrusted/.github/workflows/ci-safety-gate.yml; then
+            echo "::error title=CI safety gate::this pull request changes the trusted safety review; a maintainer must review it"
+            exit 1
+          fi
+          args=()
+          for file in untrusted/.github/workflows/*.yml untrusted/.github/workflows/*.yaml; do
+            [ -f "$file" ] || continue
+            [ "$(basename "$file")" = "ci-safety-gate.yml" ] && continue
+            # Workflows that pull requests can trigger are the ones that run untrusted code.
+            if grep -Eq '^[[:space:]]*pull_request:|^on:.*pull_request([^_]|$)' "$file"; then args+=(--workflow "$file"); fi
+          done
+          if [ "${#args[@]}" -eq 0 ]; then echo "No pull-request workflows to review."; exit 0; fi
+          node trusted/scripts/ci/assert-ci-safety.mjs --static "${args[@]}"

@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PORTAL_SHA: af68cae1bd656ec6b202df48ebc868182ce4e0fb
+  PORTAL_SHA: 316a07b7ad94f5a5eacff790906aa879537439ef
   MD_SHA: e46366696e1b75062dde0a27fa8dca0074ef724c
   TRUSTID_SHA: 8bf7852d14fe91ba28670768c7f3b2c898ce581b
   ELFCOM_SHA: f0b7e7213e4b0c8bf0efe560212ec1cd3764bdbf
@@ -99,14 +99,27 @@ jobs:
         with:
           node-version: 22
 
+      # The gate runs from the base branch's copy, so a pull request cannot weaken the gate that judges
+      # it. A base without the gate fails closed: a pull request cannot introduce its own judge.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: trusted-gate
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
       # Before any dependency install or test code runs.
-      - name: Safety gate (pins, loopback endpoints, no credentials, no secrets)
-        run: >-
-          node ddi/scripts/ci/assert-ci-safety.mjs
-          --workflow ddi/.github/workflows/d3-cross-repo-acceptance.yml
-          --pin portal=${{ env.PORTAL_SHA }}
-          --pin md=${{ env.MD_SHA }}
-          --pin trustid=${{ env.TRUSTID_SHA }}
+      - name: Safety gate (trusted copy; pins, loopback endpoints, no credentials, no secrets)
+        run: |
+          if [ ! -f trusted-gate/scripts/ci/assert-ci-safety.mjs ]; then
+            echo "::error title=CI safety gate::the base branch has no trusted safety gate; merge the gate into the base first"
+            exit 1
+          fi
+          node trusted-gate/scripts/ci/assert-ci-safety.mjs \
+          --workflow ddi/.github/workflows/d3-cross-repo-acceptance.yml \
+          --pin portal=${{ env.PORTAL_SHA }} \
+          --pin md=${{ env.MD_SHA }} \
+          --pin trustid=${{ env.TRUSTID_SHA }} \
           --pin elfcom=${{ env.ELFCOM_SHA }}
 
       - name: Install and build dependencies (TrustID, ElfCom, DDI, Portal, Master Distributor)
@@ -124,21 +137,22 @@ jobs:
           import pg from 'pg';
           const admin = new pg.Client({ connectionString: process.env.DDI_TEST_DATABASE_URL });
           await admin.connect();
-          for (const db of ['portal_unit', 'portal_pgtest', 'md_unit', 'portal_d3cb', 'md_d3cb', 'portal_d3cc', 'md_d3cc', 'portal_d3da', 'md_d3da']) await admin.query('CREATE DATABASE ' + db);
+          for (const db of ['portal_unit', 'portal_pgtest', 'md_unit', 'portal_d3cb', 'md_d3cb', 'portal_d3cc', 'md_d3cc', 'portal_d3da', 'md_d3da', 'portal_recovery']) await admin.query('CREATE DATABASE ' + db);
           await admin.end();"
 
       - name: DDI (typecheck and PostgreSQL suite)
         working-directory: ddi
         run: npm run typecheck && npm test
 
-      - name: Portal (typecheck, D3 integration, install claims, PostgreSQL store)
+      - name: Portal (typecheck, D3 integration, install claims and recovery, PostgreSQL store)
         working-directory: portal
         env:
           PORTAL_TEST_DATABASE_URL: ${{ env.PGBASE }}/portal_unit
+          PORTAL_RECOVERY_DATABASE_URL: ${{ env.PGBASE }}/portal_recovery
           PORTAL_REQUIRE_DATABASE_TESTS: "1"
         run: |
           npx tsc --noEmit -p apps/portal-api
-          node --import tsx --test --test-concurrency=1 apps/portal-api/test/ddi-ownership.test.ts apps/portal-api/test/ddi-provisioning.test.ts apps/portal-api/test/distributor-identity.test.ts apps/portal-api/test/install-claims.test.ts
+          npm run test:d3
           PORTAL_TEST_DATABASE_URL=${{ env.PGBASE }}/portal_pgtest npm run test:postgres
 
       - name: Master Distributor (typecheck, migration compatibility, full suite with PostgreSQL)
