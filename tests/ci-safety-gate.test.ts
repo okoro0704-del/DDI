@@ -38,7 +38,8 @@ const edit = (from: string | RegExp, to: string) => {
 const review = (body: string, name = NAME) => runGate(["--static", "--workflow", caseFile(body, name)], {}).failures as string[];
 const fails = (failures: string[], pattern: RegExp) => assert.ok(failures.some((f) => pattern.test(f)), `expected ${pattern} in ${JSON.stringify(failures)}`);
 const GATE_STEP = /      - name: Safety gate[\s\S]*?--pin elfcom=\$\{\{ env\.ELFCOM_SHA \}\}\n/;
-const TRUSTED_REF = "${{ github.event.pull_request.base.sha || github.sha }}";
+const TRUSTED_REF = "${{ github.event.repository.default_branch }}";
+const OLD_BASE_REF = "${{ github.event.pull_request.base.sha || github.sha }}";
 
 const RUNNER_ENV = {
   GITHUB_SERVER_URL: "https://github.com",
@@ -82,14 +83,15 @@ describe("runtime gate step is required, trusted and cannot be bypassed", () => 
   });
 
   test("gate redirected to the pull request head, a fork, or a second trusted-gate checkout", () => {
-    fails(review(edit(`ref: ${TRUSTED_REF}`, "ref: ${{ github.event.pull_request.head.sha }}")), /must check out the base commit/);
+    fails(review(edit(`ref: ${TRUSTED_REF}`, "ref: ${{ github.event.pull_request.head.sha }}")), /must check out the default branch/);
     fails(review(edit(`ref: ${TRUSTED_REF}`, `ref: ${TRUSTED_REF}\n          repository: attacker/DDI`)), /may set only ref, path, sparse-checkout and persist-credentials/);
     fails(review(edit("          path: ddi\n", "          path: trusted-gate\n")), /exactly one checkout must use path 'trusted-gate'/);
   });
 
-  test("trusted base SHA replaced", () => {
-    fails(review(edit(`ref: ${TRUSTED_REF}`, "ref: ${{ github.sha }}")), /must check out the base commit/);
-    fails(review(edit(`ref: ${TRUSTED_REF}`, `ref: ${HEAD}`)), /must check out the base commit/);
+  test("trusted default-branch ref replaced, including by the former base-commit ref", () => {
+    fails(review(edit(`ref: ${TRUSTED_REF}`, `ref: ${OLD_BASE_REF}`)), /must check out the default branch/);
+    fails(review(edit(`ref: ${TRUSTED_REF}`, "ref: ${{ github.sha }}")), /must check out the default branch/);
+    fails(review(edit(`ref: ${TRUSTED_REF}`, `ref: ${HEAD}`)), /must check out the default branch/);
     fails(review(edit("sparse-checkout: scripts/ci", "sparse-checkout: scripts")), /must be sparse on scripts\/ci/);
   });
 
@@ -99,7 +101,7 @@ describe("runtime gate step is required, trusted and cannot be bypassed", () => 
   });
 
   test("nothing may run before the gate or hijack the interpreter", () => {
-    fails(review(edit("      # The gate runs from the base", "      - run: cp evil.mjs trusted-gate/scripts/ci/assert-ci-safety.mjs\n      # The gate runs from the base")), /only pinned checkout and setup-node steps may come before the gate|gate step must run/);
+    fails(review(edit("      # The gate runs from the default", "      - run: cp evil.mjs trusted-gate/scripts/ci/assert-ci-safety.mjs\n      # The gate runs from the default")), /only pinned checkout and setup-node steps may come before the gate|gate step must run/);
     fails(review(edit("env:\n  PORTAL_SHA:", "env:\n  NODE_OPTIONS: --require ./ddi/evil.js\n  PORTAL_SHA:")), /NODE_OPTIONS can change what the gate runs/);
     fails(review(edit("    env:\n      NODE_ENV: test", "    env:\n      BASH_ENV: ddi/evil.sh\n      NODE_ENV: test")), /BASH_ENV can change what the gate runs/);
     fails(review(edit("    runs-on: ubuntu-latest", "    runs-on: ubuntu-latest\n    container: attacker/node")), /'container' is not allowed/);
@@ -197,6 +199,87 @@ describe("workflow paths are never followed or escaped", () => {
     fails(scan(changed.dir, ["--self", `${self.dir}/ci-safety-gate.yml`]), /changes the trusted safety review/);
     const removed = tree({ [NAME]: REAL });
     fails(scan(removed.dir, ["--self", `${self.dir}/ci-safety-gate.yml`]), /removes the trusted safety review/);
+  });
+});
+
+describe("removals are judged against the pull request's base (D3D-A security closure)", () => {
+  const tree = (files: Record<string, string>) => {
+    const root = `base-${++n}`;
+    const dir = join(root, ".github", "workflows");
+    mkdirSync(dir, { recursive: true });
+    for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
+    return `${root}/.github/workflows`;
+  };
+  const trusted = tree({ "ci-safety-gate.yml": SELF });
+  const PUSH = readFileSync(join(REPO, ".github", "workflows", "ddi-postgres-verification.yml"), "utf8");
+  const judge = (pr: string, base: string) =>
+    runGate(["--static", "--workflows-dir", pr, "--base-workflows-dir", base, "--exclude", "ci-safety-gate.yml", "--require", NAME, "--self", `${trusted}/ci-safety-gate.yml`], {}).failures as string[];
+
+  test("a branch that predates the gate: neither the required workflow nor the trusted review is demanded", () => {
+    const base = tree({ "ddi-postgres-verification.yml": PUSH });
+    assert.deepEqual(judge(tree({ "ddi-postgres-verification.yml": PUSH }), base), []);
+    assert.deepEqual(judge(tree({ "ddi-postgres-verification.yml": PUSH }), `missing-${++n}/.github/workflows`), [], "a base without workflows has nothing to remove");
+  });
+
+  test("what the base has cannot be removed", () => {
+    const base = tree({ [NAME]: REAL, "ci-safety-gate.yml": SELF });
+    fails(judge(tree({ "ci-safety-gate.yml": SELF }), base), new RegExp(`${NAME} is required and missing \\(the base has it\\)`));
+    fails(judge(tree({ [NAME]: REAL }), base), /removes the trusted safety review/);
+    assert.deepEqual(judge(tree({ [NAME]: REAL, "ci-safety-gate.yml": SELF }), base), []);
+  });
+
+  test("a pull request that adds the trusted review must add the trusted copy, whatever the base", () => {
+    const base = tree({ "ddi-postgres-verification.yml": PUSH });
+    fails(judge(tree({ [NAME]: REAL, "ci-safety-gate.yml": `${SELF}\n# tampered\n` }), base), /changes the trusted safety review/);
+    assert.deepEqual(judge(tree({ [NAME]: REAL, "ci-safety-gate.yml": SELF, "ddi-postgres-verification.yml": PUSH }), base), []);
+  });
+
+  test("the base directory is read as safely as the pull request's", () => {
+    const real = tree({ [NAME]: REAL });
+    const linked = `linked-base-${++n}`;
+    mkdirSync(linked);
+    symlinkSync(join(work, real.split("/")[0], ".github"), join(linked, ".github"), "junction");
+    fails(judge(tree({ [NAME]: REAL }), `${linked}/.github/workflows`), /base workflows directory: .*'\.github' is a symlink/);
+    fails(runGate(["--static", "--base-workflows-dir", real, "--workflow", `${real}/${NAME}`], {}).failures, /--base-workflows-dir needs --workflows-dir/);
+  });
+
+  test("the repository's own workflows pass the trusted review", () => {
+    const own = tree({ [NAME]: REAL, "ci-safety-gate.yml": SELF, "ddi-postgres-verification.yml": PUSH });
+    assert.deepEqual(judge(own, own), []);
+  });
+});
+
+describe("nothing in a pull request can report under the trusted review's name", () => {
+  const dir = (files: Record<string, string>) => {
+    const root = `names-${++n}`;
+    const at = join(root, ".github", "workflows");
+    mkdirSync(at, { recursive: true });
+    for (const [name, body] of Object.entries(files)) writeFileSync(join(at, name), body);
+    return `${root}/.github/workflows`;
+  };
+  const trusted = dir({ "ci-safety-gate.yml": SELF });
+  const scan = (files: Record<string, string>) =>
+    runGate(["--static", "--workflows-dir", dir({ ...files, "ci-safety-gate.yml": SELF }), "--exclude", "ci-safety-gate.yml", "--self", `${trusted}/ci-safety-gate.yml`], {}).failures as string[];
+  const push = (job: string, extra = "") =>
+    `name: push\non:\n  push:\n${extra}jobs:\n${job}    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n`;
+
+  test("an ordinary push workflow passes", () => {
+    assert.deepEqual(scan({ "push.yml": push("  build:\n") }), []);
+  });
+
+  test("a job id or display name equal to the trusted check, in any case, fails", () => {
+    fails(scan({ "push.yml": push("  ddi-trusted-ci-review:\n") }), /would publish a check named like the trusted review \(ddi-trusted-ci-review\)/);
+    fails(scan({ "push.yml": push("  build:\n    name: DDI-Trusted-CI-Review\n") }), /would publish a check named like the trusted review \(DDI-Trusted-CI-Review\)/);
+  });
+
+  test("job names cannot be computed", () => {
+    fails(scan({ "push.yml": push("  build:\n    name: ${{ github.event.inputs.label }}\n") }), /job names may not use expressions/);
+  });
+
+  test("no workflow may grant checks or statuses write", () => {
+    fails(scan({ "push.yml": push("  build:\n", "permissions:\n  statuses: write\n") }), /grants checks or statuses write/);
+    fails(scan({ "push.yml": push("  build:\n    permissions:\n      checks: write\n") }), /grants checks or statuses write/);
+    fails(scan({ "push.yml": push("  build:\n", "permissions: write-all\n") }), /grants checks or statuses write/);
   });
 });
 

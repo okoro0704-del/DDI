@@ -14,20 +14,34 @@
  *   5. The workflow file passes the review below.
  *
  * Static mode (trusted pull_request_target review of a pull request's files, read as data only):
- *   node assert-ci-safety.mjs --static --workflows-dir <dir> [--exclude <name>] [--require <name>]
- *                             [--self <trusted copy of the review workflow>]
+ *   node assert-ci-safety.mjs --static --workflows-dir <dir> [--base-workflows-dir <dir>]
+ *                             [--exclude <name>] [--require <name>] [--self <trusted copy of the review workflow>]
  *   node assert-ci-safety.mjs --static --workflow <file> [--workflow ...]
+ *   With --base-workflows-dir (the pull request's base, also read as data), --require and --self are
+ *   judged against the base: a required workflow the base has may not be removed, and the trusted
+ *   review must be absent from both or byte-identical to the trusted copy. A pull request into a branch
+ *   that predates the gate is therefore not refused for lacking files that branch never had. Without
+ *   --base-workflows-dir both apply unconditionally.
+ *
+ * Trust root: since 2025-12-08 GitHub runs every `pull_request_target` workflow from the repository's
+ * default branch, whatever the pull request's base. The runtime gate follows the same single root: its
+ * trusted copy is checked out from the default branch, so protecting that branch protects every gate.
  *
  * Review of each workflow:
  *   - Text: no secrets (`${{ secrets.* }}`, `secrets: inherit`), no privileged triggers, read-only
  *     permissions, every `uses:` pinned to a full commit SHA, loopback-only URLs and no hosted
  *     endpoints in assignments, credential-named variables only with `${{ github.run_id }}`.
  *   - Structure (strict YAML subset; anything else fails): every job of a workflow that pull requests
- *     can trigger must start with pinned checkouts, check out the base commit into `trusted-gate`,
+ *     can trigger must start with pinned checkouts, check out the default branch into `trusted-gate`,
  *     and run the gate from there as its first command, with the canonical text, on this same
  *     workflow, pinning every external checkout. Nothing may disable, condition, redirect or
  *     pre-empt it (no `if`, `continue-on-error`, `shell`, `working-directory`, `defaults`, `container`,
  *     reusable-workflow jobs, or interpreter-hijacking environment variables).
+ *   - Check integrity (with --self; every workflow in the directory, whatever its trigger, because
+ *     pushes to a same-repository branch run on the pull request's head commit): no job may publish a
+ *     check named like a job of the trusted review, job names may not use expressions, and no workflow
+ *     may grant `checks` or `statuses` write (or `write-all`), so nothing in a pull request can report
+ *     a result under the trusted review's name.
  *   - Paths: the workflows directory and every component above it are real directories inside the
  *     working directory; entries are regular `.yml`/`.yaml` files, never symlinks or other types.
  */
@@ -58,11 +72,12 @@ const HIJACKING_ENV = /^(NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_REPL_EX
 const MAX_WORKFLOW_BYTES = 512 * 1024;
 
 const TRUSTED_GATE_PATH = "trusted-gate";
-const TRUSTED_GATE_REF = "${{ github.event.pull_request.base.sha || github.sha }}";
+/** The trusted copy comes from the default branch, the same single root GitHub uses for pull_request_target. */
+const TRUSTED_GATE_REF = "${{ github.event.repository.default_branch }}";
 const GATE_SCRIPT = `${TRUSTED_GATE_PATH}/scripts/ci/assert-ci-safety.mjs`;
 const GATE_PREAMBLE = [
   `if [ ! -f ${GATE_SCRIPT} ]; then`,
-  `echo "::error title=CI safety gate::the base branch has no trusted safety gate; merge the gate into the base first"`,
+  `echo "::error title=CI safety gate::the default branch has no trusted safety gate; merge the gate into the default branch first"`,
   "exit 1",
   "fi",
   `node ${GATE_SCRIPT} \\`,
@@ -288,7 +303,7 @@ function reviewStructure(doc, file, failures) {
       const t = trusted[0];
       if (t.n > gateIndex) failures.push(`${where}: the trusted checkout must come before the gate`);
       if (keysOf(t.withs).sort().join() !== ["path", "persist-credentials", "ref", "sparse-checkout"].join()) failures.push(`${where}: the trusted checkout may set only ref, path, sparse-checkout and persist-credentials`);
-      if (t.withs.ref !== TRUSTED_GATE_REF) failures.push(`${where}: the trusted checkout must check out the base commit (${TRUSTED_GATE_REF})`);
+      if (t.withs.ref !== TRUSTED_GATE_REF) failures.push(`${where}: the trusted checkout must check out the default branch (${TRUSTED_GATE_REF})`);
       if (t.withs["sparse-checkout"] !== "scripts/ci") failures.push(`${where}: the trusted checkout must be sparse on scripts/ci`);
     }
     const own = checkouts.filter((c) => c.withs.repository === undefined && c.path !== TRUSTED_GATE_PATH);
@@ -419,28 +434,84 @@ function readRegularFile(path) {
   } finally { closeSync(fd); }
 }
 
+const WORKFLOW_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$/;
+
+/** Names of the regular workflow files in the base (data only). A base without the directory has none. */
+function baseWorkflowNames(dir, failures) {
+  const names = new Set();
+  let entries;
+  try { assertSafePath(dir, "dir"); entries = readdirSync(dir, { withFileTypes: true }); }
+  catch (err) {
+    if (err && err.code === "ENOENT") return names;
+    failures.push(`base workflows directory: ${err.message}`);
+    return null;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || !entry.isFile()) { failures.push(`base workflows directory: ${entry.name} is not a regular file`); continue; }
+    if (WORKFLOW_FILE_NAME.test(entry.name)) names.add(entry.name);
+  }
+  return names;
+}
+
+/** Check names the trusted review publishes: each job's id and display name. */
+function trustedCheckNames(selfPath, failures) {
+  try {
+    const doc = parseWorkflowYaml(readRegularFile(selfPath));
+    const names = new Set();
+    for (const [jobId, job] of Object.entries(isMap(doc.jobs) ? doc.jobs : {})) {
+      names.add(jobId.toLowerCase());
+      if (isMap(job) && typeof job.name === "string") names.add(job.name.toLowerCase());
+    }
+    if (!names.size) throw new Error("it has no jobs");
+    return names;
+  } catch (err) { failures.push(`trusted review copy ${selfPath} cannot be read: ${err.message}`); return null; }
+}
+
+/** Nothing in a pull request may report a result under the trusted review's check name. */
+function reviewCheckIntegrity(doc, text, file, trusted, failures) {
+  const name = basename(file);
+  if (/permissions:\s*write-all\b/.test(text) || /^\s+(checks|statuses):\s*write\b/m.test(text)) failures.push(`${name} grants checks or statuses write (it could report a result under the trusted review's name)`);
+  for (const [jobId, job] of Object.entries(isMap(doc.jobs) ? doc.jobs : {})) {
+    const jobName = isMap(job) && job.name !== undefined && job.name !== null ? String(job.name) : undefined;
+    if (jobName !== undefined && jobName.includes("${{")) failures.push(`${name} job ${jobId}: job names may not use expressions (one could resolve to the trusted review's check name)`);
+    for (const candidate of [jobId, jobName]) {
+      if (candidate !== undefined && trusted.has(candidate.toLowerCase())) failures.push(`${name} job ${jobId}: would publish a check named like the trusted review (${candidate})`);
+    }
+  }
+}
+
 function reviewWorkflowsDir(dir, options, failures) {
   let entries;
   try { assertSafePath(dir, "dir"); entries = readdirSync(dir, { withFileTypes: true }); } catch (err) { failures.push(`workflows directory: ${err.message}`); return; }
+  const base = options.baseDir ? baseWorkflowNames(options.baseDir, failures) : undefined;
+  if (base === null) return;
+  const trusted = options.self ? trustedCheckNames(options.self, failures) : undefined;
+  if (trusted === null) return;
   const names = new Set();
   for (const entry of entries) {
     const label = `${dir}/${entry.name}`;
     if (entry.isSymbolicLink()) { failures.push(`${label} is a symlink`); continue; }
     if (!entry.isFile()) { failures.push(`${label} is not a regular file`); continue; }
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$/.test(entry.name)) { failures.push(`${label} is not an expected workflow file name`); continue; }
+    if (!WORKFLOW_FILE_NAME.test(entry.name)) { failures.push(`${label} is not an expected workflow file name`); continue; }
     names.add(entry.name);
     if (options.exclude.includes(entry.name)) continue;
     let source;
     try { source = readRegularFile(label); } catch (err) { failures.push(err.message); continue; }
-    reviewWorkflowSource(source, label, failures);
+    const doc = reviewWorkflowSource(source, label, failures);
+    if (doc && trusted) reviewCheckIntegrity(doc, stripComments(source), label, trusted, failures);
   }
-  for (const required of options.require) if (!names.has(required)) failures.push(`${dir}/${required} is required and missing`);
+  // With a base, only what the base already has can be "removed"; a branch that predates the gate
+  // is not refused for files it never had.
+  for (const required of options.require) {
+    if (base && !base.has(required)) continue;
+    if (!names.has(required)) failures.push(`${dir}/${required} is required and missing${base ? " (the base has it)" : ""}`);
+  }
   if (options.self) {
     // A change to the trusted review itself needs a maintainer, not the review it would replace.
     const name = basename(options.self);
     try {
-      if (!names.has(name)) throw new Error("removed");
-      if (readRegularFile(options.self) !== readRegularFile(`${dir}/${name}`)) throw new Error("changed");
+      if (!names.has(name)) { if (!base || base.has(name)) throw new Error("removed"); }
+      else if (readRegularFile(options.self) !== readRegularFile(`${dir}/${name}`)) throw new Error("changed");
     } catch (err) { failures.push(`this pull request ${err.message === "removed" ? "removes" : "changes"} the trusted safety review (${name}); a maintainer must review it`); }
   }
 }
@@ -480,7 +551,7 @@ export function runGate(argv, env) {
   const failures = [];
   const pins = [];
   const workflows = [];
-  const options = { exclude: [], require: [], self: "" };
+  const options = { exclude: [], require: [], self: "", baseDir: "" };
   let staticMode = false;
   let workflowsDir = "";
   for (let i = 0; i < argv.length; i++) {
@@ -492,9 +563,11 @@ export function runGate(argv, env) {
     else if (arg === "--exclude") options.exclude.push(argv[++i]);
     else if (arg === "--require") options.require.push(argv[++i]);
     else if (arg === "--self") options.self = argv[++i];
+    else if (arg === "--base-workflows-dir") options.baseDir = argv[++i];
     else failures.push(`unknown argument ${arg}`);
   }
   if (workflowsDir && !staticMode) failures.push("--workflows-dir is only for --static review");
+  if (options.baseDir && !workflowsDir) failures.push("--base-workflows-dir needs --workflows-dir");
   if (!workflows.length && !workflowsDir) failures.push("no --workflow or --workflows-dir given");
   for (const workflow of workflows) {
     let source;
