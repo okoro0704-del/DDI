@@ -46,8 +46,9 @@ has never run: on PR #4 its file was on the base branch, not on the default bran
 - **No PR can bypass checks by changing its own workflow.** The review runs from `master`, so a PR
   cannot edit it; every PR-triggerable workflow must start with the runtime gate; a PR may not
   remove a required workflow its base has, nor remove or alter the trusted review; and no workflow
-  in a PR (any trigger) may publish a check named like `ddi-trusted-ci-review`, compute a job name,
-  or grant `checks`/`statuses` write.
+  in a PR (any trigger) may publish a check named like `ddi-trusted-ci-review` (compared case- and
+  whitespace-insensitively), compute a job name, or grant `checks`/`statuses` write (read from the
+  parsed workflow and every job, so quoted or folded values count).
 - **Compatible with branches that predate the gate.** `--require` and `--self` are judged against
   the PR's base, so the existing drafts can merge in order (2.3).
 - **Pinned.** Every `uses:` is a full commit SHA; sibling repositories and the PostgreSQL image are
@@ -59,7 +60,7 @@ Simulated locally with the new trusted gate against each head and base (section 
 
 | # | Pull request | Head | Base | Trusted review |
 | --- | --- | --- | --- | --- |
-| 1 | **New** "CI trust root" from `bootstrap/ddi-ci-trust-root-master-v2` | `07d3892` (= `6cf8589` + correction) | `master` | not yet active (human review only) |
+| 1 | **New** "CI trust root" from `bootstrap/ddi-ci-trust-root-master-v2` | `8abde03` (= `6cf8589` + two corrections) | `master` | not yet active (human review only) |
 | 2 | Approve and create the Actions policies (3.1) before 2026-11-02, then the `master` ruleset (3.2) | — | — | — |
 | 3 | Existing **#1** D3C | `b7c3def` | `pdi-communication-v1-ci-verify` | passes |
 | 4 | **New** "D3D-A + D3D-B1 + security closure" from `feature/ddi-d3d-a-security-closure` | this branch | `pdi-communication-v1-ci-verify` (after 3) | passes |
@@ -192,7 +193,11 @@ validation, one test fixture and docs):
 ## 6. Verification (local)
 
 - Typecheck clean. Database-free DDI suites pass (api 9, commercial-units 5, foundation 18,
-  ownership-verification 2, service-token 4, v11-durability 1); CI gate 34/34 (25 existing, 9 new).
+  ownership-verification 2, service-token 4, v11-durability 1); CI gate 35/35 (25 existing, 10 new).
+- Activation pre-flight: a 17-case impersonation matrix (job id/name collisions in any case or
+  padding, computed names, matrix and reusable jobs, plain/quoted/folded `checks`/`statuses` write and
+  `write-all`) is refused, with an ordinary workflow as control; the non-cone pattern materialises only
+  `.github/workflows/`.
 - Mutation checks: making `--require` unconditional, dropping check integrity, reverting the trust
   root, accepting a missing trusted review everywhere, and allowing production http each fail tests.
 - Trusted-review simulation: the new sequence passes; old #2, #3 (without closure) and #5 heads, a
