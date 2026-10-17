@@ -281,6 +281,16 @@ describe("nothing in a pull request can report under the trusted review's name",
     fails(scan({ "push.yml": push("  build:\n    permissions:\n      checks: write\n") }), /grants checks or statuses write/);
     fails(scan({ "push.yml": push("  build:\n", "permissions: write-all\n") }), /grants checks or statuses write/);
   });
+
+  test("quoting and padding do not hide a status grant or a colliding name (pre-flight)", () => {
+    fails(scan({ "push.yml": push("  build:\n", 'permissions:\n  statuses: "write"\n') }), /grants checks or statuses write/);
+    fails(scan({ "push.yml": push("  build:\n    permissions:\n      checks: 'write'\n") }), /grants checks or statuses write/);
+    fails(scan({ "push.yml": push('  build:\n    permissions: "write-all"\n') }), /grants checks or statuses write/);
+    fails(scan({ "push.yml": push("  build:\n", "permissions:\n  statuses: >-\n    write\n") }), /grants checks or statuses write/);
+    fails(scan({ "push.yml": push('  build:\n    name: "ddi-trusted-ci-review "\n') }), /would publish a check named like the trusted review/);
+    fails(scan({ "push.yml": push('  build:\n    name: " DDI-trusted-ci-review"\n') }), /would publish a check named like the trusted review/);
+    assert.deepEqual(scan({ "push.yml": push("  build:\n", "permissions:\n  contents: read\n  statuses: read\n") }), [], "read access stays allowed");
+  });
 });
 
 describe("runtime environment (unchanged guarantees)", () => {

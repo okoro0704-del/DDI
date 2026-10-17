@@ -453,29 +453,43 @@ function baseWorkflowNames(dir, failures) {
   return names;
 }
 
+/** Check-name comparison ignores case and surrounding or repeated whitespace (GitHub may normalise either). */
+const checkName = (value) => String(value).replace(/\s+/g, " ").trim().toLowerCase();
+
 /** Check names the trusted review publishes: each job's id and display name. */
 function trustedCheckNames(selfPath, failures) {
   try {
     const doc = parseWorkflowYaml(readRegularFile(selfPath));
     const names = new Set();
     for (const [jobId, job] of Object.entries(isMap(doc.jobs) ? doc.jobs : {})) {
-      names.add(jobId.toLowerCase());
-      if (isMap(job) && typeof job.name === "string") names.add(job.name.toLowerCase());
+      names.add(checkName(jobId));
+      if (isMap(job) && typeof job.name === "string") names.add(checkName(job.name));
     }
     if (!names.size) throw new Error("it has no jobs");
     return names;
   } catch (err) { failures.push(`trusted review copy ${selfPath} cannot be read: ${err.message}`); return null; }
 }
 
+/** True when a parsed `permissions` value grants write to checks or statuses (quoted or not). */
+function grantsStatusWrite(permissions) {
+  if (permissions === undefined || permissions === null) return false;
+  if (typeof permissions === "string") return checkName(permissions) === "write-all";
+  if (!isMap(permissions)) return true; // unknown shapes fail closed
+  return ["checks", "statuses"].some((scope) => permissions[scope] !== undefined && checkName(permissions[scope]) === "write");
+}
+
 /** Nothing in a pull request may report a result under the trusted review's check name. */
 function reviewCheckIntegrity(doc, text, file, trusted, failures) {
   const name = basename(file);
-  if (/permissions:\s*write-all\b/.test(text) || /^\s+(checks|statuses):\s*write\b/m.test(text)) failures.push(`${name} grants checks or statuses write (it could report a result under the trusted review's name)`);
-  for (const [jobId, job] of Object.entries(isMap(doc.jobs) ? doc.jobs : {})) {
+  const jobs = Object.entries(isMap(doc.jobs) ? doc.jobs : {});
+  const statusWrite = grantsStatusWrite(doc.permissions) || jobs.some(([, job]) => isMap(job) && grantsStatusWrite(job.permissions))
+    || /permissions:\s*["']?write-all\b/.test(text) || /^\s+["']?(checks|statuses)["']?:\s*["']?write\b/m.test(text);
+  if (statusWrite) failures.push(`${name} grants checks or statuses write (it could report a result under the trusted review's name)`);
+  for (const [jobId, job] of jobs) {
     const jobName = isMap(job) && job.name !== undefined && job.name !== null ? String(job.name) : undefined;
     if (jobName !== undefined && jobName.includes("${{")) failures.push(`${name} job ${jobId}: job names may not use expressions (one could resolve to the trusted review's check name)`);
     for (const candidate of [jobId, jobName]) {
-      if (candidate !== undefined && trusted.has(candidate.toLowerCase())) failures.push(`${name} job ${jobId}: would publish a check named like the trusted review (${candidate})`);
+      if (candidate !== undefined && trusted.has(checkName(candidate))) failures.push(`${name} job ${jobId}: would publish a check named like the trusted review (${candidate.trim()})`);
     }
   }
 }
