@@ -1,7 +1,7 @@
 import test, { after, before, describe } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { createSecretKey, randomUUID } from "node:crypto";
+import { createSecretKey, randomBytes, randomUUID } from "node:crypto";
 import { join } from "node:path"; import { pathToFileURL } from "node:url";
 import { Pool } from "pg";
 import { SignJWT } from "jose";
@@ -18,6 +18,9 @@ const ELFCOM_ROOT = process.env.DDI_ELFCOM_ROOT ?? "C:/Users/Hp/Desktop/ELFCOMS"
 const ELFCOM = join(ELFCOM_ROOT, "apps", "elfcom-node");
 const PORT = 18792;
 const SERVICE_TOKEN = "ddi-communication-proof-token";
+// Per run, and handed to ElfCom explicitly: never ElfCom's committed fallback, which is public and
+// must never authenticate anything (D3D-A security closure).
+const ELFCOM_JWT_SECRET = randomBytes(32).toString("base64url");
 const BASE = `http://127.0.0.1:${PORT}`;
 
 function assertLocal(url: string) {
@@ -35,7 +38,7 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
   before(async () => {
     if (!databaseUrl) throw new Error("DDI_TEST_DATABASE_URL_REQUIRED");
     assertLocal(databaseUrl);
-    const env: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: "development", ELFCOM_PORT: String(PORT), ELFCOM_PDI_SERVICE_TOKEN: SERVICE_TOKEN };
+    const env: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: "development", ELFCOM_PORT: String(PORT), ELFCOM_PDI_SERVICE_TOKEN: SERVICE_TOKEN, LIFEOS_JWT_SECRET: ELFCOM_JWT_SECRET };
     delete env.DATABASE_URL;
     elfcom = spawn(process.execPath, [join(ELFCOM_ROOT, "node_modules", "tsx", "dist", "cli.mjs"), "src/index.ts"], { cwd: ELFCOM, env, stdio: ["ignore", "pipe", "pipe"] });
     let log = "";
@@ -262,7 +265,7 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
 });
 
 async function elfcomSession(owner: string) {
-  const secret = "elfcom-dev-node-secret-change-me";
+  const secret = ELFCOM_JWT_SECRET;
   const sid = `proof:${owner}`;
   const specifier = pathToFileURL(join(ELFCOM_ROOT, "packages", "elfcom-crypto", "dist", "index.js")).href;
   const crypto = await import(specifier) as { computeZkBind(key: Buffer, fields: { aud: string; sid: string; ownerTrustId: string }): string; derivePhaseASessionKey(secret: string, owner: string, sid: string): Buffer };

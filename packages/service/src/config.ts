@@ -24,9 +24,29 @@ export type DdiConfig = {
   /** D3C-B: `portal-local-integration` enables the real Portal provisioning adapter outside production only. */
   provisioningMode?: "portal-local-integration";
   portalProvisioningUrl?: string;
+  /** ElfCom PDI inbox endpoint and DDI's static bearer for it, validated here so the bearer is never sent to an unsafe URL. */
+  elfcomBaseUrl?: string;
+  elfcomPdiServiceToken?: string;
 };
 
 function invalid(): never { throw new Error("DDI_PRODUCTION_CONFIGURATION_INVALID"); }
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+/**
+ * D3D-A: the ElfCom bearer travels in every inbox request. The URL must be a plain http(s) origin and
+ * path (credentials, queries and fragments would leak or be ignored); in production it must be https,
+ * except loopback and Railway private networking (`*.railway.internal`, encrypted in transit).
+ */
+function safeElfComUrl(value: string, production: boolean) {
+  let url: URL;
+  try { url = new URL(value); } catch { return false; }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return false;
+  if (url.username || url.password || url.search || url.hash) return false;
+  const host = url.hostname.toLowerCase();
+  if (production && url.protocol === "http:" && !LOOPBACK_HOSTS.has(host) && !host.endsWith(".railway.internal")) return false;
+  return true;
+}
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): DdiConfig {
   const marker = env.DDI_ENV;
@@ -42,6 +62,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DdiConfig {
   if (production && Object.values(trustedServices).some(service => Object.keys(service.keys).some(kid => kid.startsWith("test-")))) invalid();
   const mode = env.DDI_COMMERCIAL_PROVISIONING_MODE;
   if (mode !== undefined && mode !== "" && mode !== "portal-local-integration") invalid();
+  const elfcomBaseUrl = env.ELFCOM_BASE_URL || undefined;
+  if (elfcomBaseUrl && !safeElfComUrl(elfcomBaseUrl, production)) invalid();
   const config: DdiConfig = {
     environment,
     databaseUrl: env.DATABASE_URL,
@@ -62,6 +84,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DdiConfig {
     serviceSigner,
     provisioningMode: mode === "portal-local-integration" ? mode : undefined,
     portalProvisioningUrl: env.PORTAL_PROVISIONING_URL,
+    elfcomBaseUrl,
+    elfcomPdiServiceToken: env.ELFCOM_PDI_SERVICE_TOKEN || undefined,
   };
   if (production) {
     // D3C-C: DDI authenticates to the Portal with its own service identity; the D3A shared secret is not accepted in production.
