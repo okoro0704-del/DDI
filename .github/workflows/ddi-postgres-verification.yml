@@ -43,6 +43,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: okoro0704-del/elfCOM
+          ref: f0b7e7213e4b0c8bf0efe560212ec1cd3764bdbf
           path: elfcom
       - uses: actions/setup-node@v4
         with:
@@ -52,10 +53,10 @@ jobs:
         run: npm ci
       - name: Build TrustID verifier contracts
         working-directory: trustid
-        run: npm ci && npm run build:security
-      - name: Install and build ElfCom contracts
+        run: npm ci && npm run build:security && npm run build -w @trustid/digi-rp
+      - name: Install and build ElfCom node dependencies
         working-directory: elfcom
-        run: npm ci && npm run build -w @elfcom/contract && npm run build -w @elfcom/crypto
+        run: npm ci && npm run build -w @elfcom/node
       - name: Typecheck DDI
         run: npm run typecheck
       - name: Verify localhost safety gate
