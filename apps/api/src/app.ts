@@ -1,15 +1,23 @@
 import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyReply } from "fastify";
-import type { Actor, ApplicationRecord, Capability, CapabilityRequest, CapabilityResult, ExecutionMode, InfrastructureRecord, InfrastructureType, PdiApplicationConnection } from "../../../packages/contracts/src/index.ts";
+import type { Actor, ApplicationRecord, Capability, CapabilityRequest, CapabilityResult, ConnectedPropertyType, ExecutionMode, InfrastructureRecord, InfrastructureType, PdiApplicationConnection } from "../../../packages/contracts/src/index.ts";
 import { authorityBinding, describeCapabilities } from "../../../packages/core/src/connection.ts";
 import type { DdiConfig } from "../../../packages/service/src/config.ts";
+import { commercialRouteInventory, registerCommercialRoutes, type CommercialApi } from "./commercial-routes.ts";
+import { portalRouteInventory, registerPortalRoutes } from "./portal-routes.ts";
+import type { PostgresPortalInstallState } from "../../../packages/service/src/portal-install-state.ts";
+import { ServiceTokenVerifier, type ReplayStore } from "../../../packages/service/src/service-token.ts";
 
 export type DdiApiService = {
   authenticate(token: string): Promise<Actor | null>;
   authenticateApplication(secret: string): Promise<ApplicationRecord | null>;
   provision(actor: Actor, input: { type: InfrastructureType; metadata?: Record<string, string>; idempotencyKey: string }): Promise<InfrastructureRecord>;
   findPersonal(actor: Actor): Promise<InfrastructureRecord | null>;
-  registerApp(actor: Actor, infrastructureId: string, input: { type: string; displayName: string; publicUrl?: string; adminUrl?: string; capabilities: Capability[]; idempotencyKey: string }): Promise<unknown>;
+  registerApp(actor: Actor, infrastructureId: string, input: { type: string; displayName: string; publicUrl?: string; adminUrl?: string; propertyId?: string; capabilities: Capability[]; idempotencyKey: string }): Promise<unknown>;
+  provisionProperty?(actor: Actor, input: { type: ConnectedPropertyType; externalSystem: string; externalReference: string; displayName: string; idempotencyKey: string }): Promise<unknown>;
+  getProperty?(id: string): Promise<{ ownerId: string; infrastructureId: string } | null>;
+  listProperties?(infrastructureId: string): Promise<unknown[]>;
+  revokeProperty?(actor: Actor, id: string, correlationId: string, sessionToken?: string): Promise<unknown>;
   getInfrastructure(id: string): Promise<InfrastructureRecord | null>;
   view(infrastructureId: string): Promise<unknown>;
   requestConnection(applicationId: string, capabilities: Capability[], correlationId: string, idempotencyKey: string): Promise<PdiApplicationConnection>;
@@ -31,6 +39,9 @@ export const routeInventory = [
   { method: "POST", url: "/infrastructures/:id/apps/:appId/grants", access: "RETIRED_CONSENT_BYPASS" },
   { method: "GET", url: "/me/pdi", access: "AUTHENTICATED_ADMINISTRATION" },
   { method: "POST", url: "/me/pdi", access: "AUTHENTICATED_ADMINISTRATION" },
+  { method: "POST", url: "/me/pdi/properties", access: "AUTHENTICATED_OWNER_PROVISIONING" },
+  { method: "GET", url: "/me/pdi/manage", access: "AUTHENTICATED_ADMINISTRATION" },
+  { method: "POST", url: "/properties/:id/revoke", access: "OWNER_CONSENT" },
   { method: "POST", url: "/infrastructures/:id/connections", access: "APPLICATION_AUTHENTICATED" },
   { method: "GET", url: "/infrastructures/:id/connections", access: "AUTHENTICATED_ADMINISTRATION" },
   { method: "GET", url: "/connections/:id", access: "AUTHENTICATED_PARTY" },
@@ -40,11 +51,20 @@ export const routeInventory = [
   { method: "POST", url: "/connections/:id/capabilities/revoke", access: "OWNER_CONSENT" },
   { method: "GET", url: "/infrastructures/:id/infrastructure", access: "AUTHENTICATED_ADMINISTRATION" },
   { method: "POST", url: "/capabilities/execute", access: "AUTHORITY_ENFORCED" },
+  ...commercialRouteInventory,
+  ...portalRouteInventory,
 ] as const;
 
 type Deps = {
   service: DdiApiService;
   config: DdiConfig;
+  /** D3B commercial activation. Absent means the commercial routes fail closed with 503. */
+  commercial?: CommercialApi;
+  /** D3C-B: Portal install-state propagation. Absent means the event route fails closed with 503. */
+  installState?: PostgresPortalInstallState;
+  /** D3C-C: shared atomic replay store for service tokens. Required in production. */
+  serviceReplay?: ReplayStore;
+  now?: () => Date;
   database?: () => Promise<"UP" | "DOWN" | "UNCONFIGURED">;
   identity?: () => Promise<"CONNECTED" | "DEGRADED" | "UNAVAILABLE">;
 };
@@ -69,7 +89,7 @@ export function resultStatus(status: CapabilityResult["status"]) {
   return 400;
 }
 
-export function buildApi({ service, config, database = async () => "UNCONFIGURED", identity = async () => "CONNECTED" }: Deps) {
+export function buildApi({ service, config, commercial, installState, serviceReplay, now, database = async () => "UNCONFIGURED", identity = async () => "CONNECTED" }: Deps) {
   const app = Fastify({ logger: false });
   const actorFrom = async (header: string | undefined) => header?.startsWith("Bearer ") ? service.authenticate(header.slice(7)) : null;
   const applicationFrom = async (header: string | undefined) => header?.startsWith("Application ") ? service.authenticateApplication(header.slice("Application ".length)) : null;
@@ -110,9 +130,9 @@ export function buildApi({ service, config, database = async () => "UNCONFIGURED
   app.post("/infrastructures/:id/apps", async (request, reply) => {
     const actor = await actorFrom(request.headers.authorization);
     if (!actor) return reply.code(401).send({ code: "AUTHENTICATION_REQUIRED" });
-    const body = request.body as { type?: string; displayName?: string; publicUrl?: string; adminUrl?: string; capabilities?: Capability[] };
+    const body = request.body as { type?: string; displayName?: string; publicUrl?: string; adminUrl?: string; propertyId?: string; capabilities?: Capability[] };
     try {
-      return await service.registerApp(actor, (request.params as { id: string }).id, { type: String(body?.type ?? ""), displayName: String(body?.displayName ?? ""), publicUrl: body?.publicUrl, adminUrl: body?.adminUrl, capabilities: body?.capabilities ?? [], idempotencyKey: String(request.headers["idempotency-key"] ?? "") });
+      return await service.registerApp(actor, (request.params as { id: string }).id, { type: String(body?.type ?? ""), displayName: String(body?.displayName ?? ""), publicUrl: body?.publicUrl, adminUrl: body?.adminUrl, propertyId: body?.propertyId, capabilities: body?.capabilities ?? [], idempotencyKey: String(request.headers["idempotency-key"] ?? "") });
     } catch (error) { return sendFailure(reply, error); }
   });
   app.post("/infrastructures/:id/apps/:appId/grants", async (_request, reply) => reply.code(403).send({ code: "CONSENT_ROUTE_RETIRED" }));
@@ -126,6 +146,32 @@ export function buildApi({ service, config, database = async () => "UNCONFIGURED
     const actor = await actorFrom(request.headers.authorization);
     if (!actor) return reply.code(401).send({ code: "AUTHENTICATION_REQUIRED" });
     try { return await service.provision(actor, { type: "PERSONAL", metadata: (request.body as { metadata?: Record<string, string> } | undefined)?.metadata, idempotencyKey: String(request.headers["idempotency-key"] ?? "") }); }
+    catch (error) { return sendFailure(reply, error); }
+  });
+  app.post("/me/pdi/properties", async (request, reply) => {
+    const actor = await actorFrom(request.headers.authorization);
+    if (!actor) return reply.code(401).send({ code: "AUTHENTICATION_REQUIRED" });
+    if (!service.provisionProperty) return reply.code(503).send({ code: "UNAVAILABLE" });
+    const body = request.body as { type?: ConnectedPropertyType; externalSystem?: string; externalReference?: string; displayName?: string };
+    try { return await service.provisionProperty(actor, { type: body?.type as ConnectedPropertyType, externalSystem: String(body?.externalSystem ?? ""), externalReference: String(body?.externalReference ?? ""), displayName: String(body?.displayName ?? ""), idempotencyKey: String(request.headers["idempotency-key"] ?? "") }); }
+    catch (error) { return sendFailure(reply, error); }
+  });
+  app.get("/me/pdi/manage", async (request, reply) => {
+    const actor = await actorFrom(request.headers.authorization);
+    if (!actor) return reply.code(401).send({ code: "AUTHENTICATION_REQUIRED" });
+    const infra = await service.findPersonal(actor);
+    if (!infra) return { state: "NOT_PROVISIONED" };
+    return service.view(infra.id);
+  });
+  app.post("/properties/:id/revoke", async (request, reply) => {
+    const actor = await actorFrom(request.headers.authorization);
+    if (!actor) return reply.code(401).send({ code: "AUTHENTICATION_REQUIRED" });
+    if (!service.getProperty || !service.revokeProperty) return reply.code(503).send({ code: "UNAVAILABLE" });
+    const property = await service.getProperty((request.params as { id: string }).id);
+    if (!property) return reply.code(404).send({ code: "PROPERTY_NOT_FOUND" });
+    if (property.ownerId !== actor.ownerId) return reply.code(403).send({ code: "DENIED" });
+    const header = request.headers.authorization;
+    try { return await service.revokeProperty(actor, (request.params as { id: string }).id, String(request.headers["x-correlation-id"] ?? randomUUID()), header?.startsWith("Bearer ") ? header.slice(7) : undefined); }
     catch (error) { return sendFailure(reply, error); }
   });
   app.post("/infrastructures/:id/connections", async (request, reply) => {
@@ -200,11 +246,12 @@ export function buildApi({ service, config, database = async () => "UNCONFIGURED
     if (!infrastructure) return reply.code(404).send({ code: "INFRASTRUCTURE_NOT_FOUND" });
     const body = request.body as { capability?: Capability; authorityToken?: string; executionMode?: ExecutionMode; payload?: unknown };
     if (!body?.capability) return reply.code(400).send({ code: "INVALID_REQUEST" });
-    const binding = authorityBinding(application.id, infrastructure.id, body.capability);
+    const binding = authorityBinding(application.id, infrastructure.id, body.capability, application.propertyId);
     try {
       const result = await service.execute({
         infrastructureId: infrastructure.id,
         applicationId: application.id,
+        propertyId: application.propertyId,
         capability: body.capability,
         action: binding.action,
         resource: binding.resource,
@@ -218,5 +265,11 @@ export function buildApi({ service, config, database = async () => "UNCONFIGURED
       return reply.code(resultStatus(result.status)).send(result);
     } catch { return reply.code(503).send({ code: "UNAVAILABLE" }); }
   });
+  // Service callers are authenticated by pinned keys; permissions come from DDI's own trust configuration.
+  // A per-process replay cache cannot stop a token replayed against another instance: production needs the shared store.
+  if (config.environment === "production" && Object.keys(config.trustedServices).length && !serviceReplay) throw new Error("DDI_PRODUCTION_CONFIGURATION_INVALID");
+  const serviceAuth = Object.keys(config.trustedServices).length ? new ServiceTokenVerifier({ audience: config.serviceSigner?.serviceId ?? "ddi", services: config.trustedServices, production: config.environment === "production", now: now ? () => now().getTime() : undefined, replay: serviceReplay }) : undefined;
+  registerCommercialRoutes(app, { commercial, actorFrom, applicationFrom, getInfrastructure: id => service.getInfrastructure(id), serviceAuth });
+  registerPortalRoutes(app, { serviceAuth, installState, now });
   return app;
 }

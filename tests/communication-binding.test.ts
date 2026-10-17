@@ -41,12 +41,16 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     let log = "";
     elfcom.stdout?.on("data", (chunk) => { log += String(chunk); });
     elfcom.stderr?.on("data", (chunk) => { log += String(chunk); });
+    // Ready means ElfCom answers GET /health, not that it printed a line; a cold tsx compile under
+    // load can be slow, so the ceiling is generous and an early exit fails at once.
     const started = Date.now();
-    while (!log.includes("listening") && Date.now() - started < 60000) {
+    let healthy = false;
+    while (!healthy && Date.now() - started < 120_000) {
       if (elfcom.exitCode !== null) throw new Error(log.slice(-1000));
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      healthy = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false);
+      if (!healthy) await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    if (!log.includes("listening")) throw new Error(log.slice(-1000));
+    if (!healthy) throw new Error(`ElfCom never became healthy: ${log.slice(-1000)}`);
     const admin = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 5000 });
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
@@ -55,6 +59,12 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     await migrate(pool, join("migrations", "001_ddi_foundation.sql"));
     await migrate(pool, join("migrations", "002_ddi_runtime.sql"));
     await migrate(pool, join("migrations", "003_pdi_connections.sql"));
+    await migrate(pool, join("migrations", "004_connected_properties.sql"));
+    await migrate(pool, join("migrations", "005_commercial_activation.sql"));
+    await migrate(pool, join("migrations", "006_commercial_recovery.sql"));
+    await migrate(pool, join("migrations", "007_portal_install_state.sql"));
+    await migrate(pool, join("migrations", "008_download_grant_version.sql"));
+    await migrate(pool, join("migrations", "009_service_token_replay.sql"));
     repository = new PostgresDdiRepository(pool);
     process.env.ELFCOM_BASE_URL = BASE;
     process.env.ELFCOM_PDI_SERVICE_TOKEN = SERVICE_TOKEN;

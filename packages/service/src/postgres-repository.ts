@@ -1,13 +1,14 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
-import type { ApplicationRecord, AuditRecord, AuthorityGrantRef, Capability, ConnectionAuditRecord, DigiOwnerId, InfrastructureRecord, PdiApplicationConnection, PrimitiveBinding, Relationship } from "../../contracts/src/index.ts";
+import type { ApplicationRecord, AuditRecord, AuthorityGrantRef, Capability, ConnectedProperty, ConnectedPropertyStatus, ConnectionAuditRecord, DigiOwnerId, InfrastructureRecord, PdiApplicationConnection, PrimitiveBinding, Relationship } from "../../contracts/src/index.ts";
 import { assertCapabilitySubset, authorityBinding, sameCapabilities } from "../../core/src/connection.ts";
 import { communicationBindingReference, isCanonicalMailboxSubject, parseCommunicationBinding } from "../../core/src/index.ts";
 import type { PersistentState } from "./store.ts";
-import type { DdiRepository, ProvisionInput, RegisterAppInput } from "./repository.ts";
+import type { DdiRepository, ProvisionInput, ProvisionPropertyInput, RegisterAppInput } from "./repository.ts";
 
 type InfraRow = { id: string; owner_id: string | null; type: InfrastructureRecord["type"]; status: InfrastructureRecord["status"]; metadata: Record<string, string>; created_at: Date; updated_at: Date };
-type AppRow = { id: string; infrastructure_id: string; type: string; display_name: string; public_url: string | null; admin_url: string | null; status: ApplicationRecord["status"]; requested_capabilities: Capability[]; granted_capabilities: Capability[]; created_at: Date; updated_at: Date };
+type AppRow = { id: string; infrastructure_id: string; property_id: string | null; type: string; display_name: string; public_url: string | null; admin_url: string | null; status: ApplicationRecord["status"]; requested_capabilities: Capability[]; granted_capabilities: Capability[]; created_at: Date; updated_at: Date };
+type PropertyRow = { id: string; infrastructure_id: string; owner_id: string; property_type: ConnectedProperty["type"]; external_system: string; external_reference: string; display_name: string; status: ConnectedPropertyStatus; ownership_evidence: string; created_at: Date; updated_at: Date; revoked_at: Date | null };
 type BindingRow = { id: string; infrastructure_id: string; namespace: PrimitiveBinding["namespace"]; provider: PrimitiveBinding["provider"]; configured: boolean; provider_reference: string | null };
 type RelationRow = { id: string; source: string; target: string; relationship_type: Relationship["type"]; created_at: Date };
 
@@ -93,6 +94,11 @@ export class PostgresDdiRepository implements DdiRepository {
       if (!infra) throw new Error("UNKNOWN_INFRASTRUCTURE");
       if (infra.ownerId !== ownerId) throw new Error("OWNER_REQUIRED");
       if (infra.status !== "ACTIVE") throw new Error("INFRASTRUCTURE_NOT_ACTIVE");
+      if (input.propertyId) {
+        const property = await this.property(client, input.propertyId);
+        if (!property || property.infrastructureId !== infra.id) throw new Error("PROPERTY_NOT_FOUND");
+        if (property.status !== "ACTIVE") throw new Error("PROPERTY_NOT_ACTIVE");
+      }
       await client.query(`INSERT INTO ddi_idempotency (key, owner_subject, owner_id, response, created_at) VALUES ($1, '', $2, '{}'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING`, [key, ownerId]);
       const locked = await client.query<{ owner_id: string | null; response: { id?: string } }>(`SELECT owner_id, response FROM ddi_idempotency WHERE key = $1 FOR UPDATE`, [key]);
       const row = locked.rows[0];
@@ -105,13 +111,62 @@ export class PostgresDdiRepository implements DdiRepository {
       const at = new Date().toISOString();
       const secret = `ddiapp_${randomBytes(32).toString("base64url")}`;
       const credentialHash = createHash("sha256").update(secret).digest("hex");
-      const app: ApplicationRecord & { applicationCredential: string } = { id: `app:${randomUUID()}` as ApplicationRecord["id"], infrastructureId: infra.id, type: input.type, displayName: input.displayName, publicUrl: input.publicUrl, adminUrl: input.adminUrl, status: "ACTIVE", requestedCapabilities: input.capabilities, grantedCapabilities: [], createdAt: at, updatedAt: at, applicationCredential: secret };
-      await client.query(`INSERT INTO ddi_applications (id, infrastructure_id, type, display_name, public_url, admin_url, status, requested_capabilities, granted_capabilities, credential_hash, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'[]'::jsonb,$9,$10,$10)`, [app.id, app.infrastructureId, app.type, app.displayName, app.publicUrl ?? null, app.adminUrl ?? null, app.status, JSON.stringify(app.requestedCapabilities), credentialHash, at]);
+      const app: ApplicationRecord & { applicationCredential: string } = { id: `app:${randomUUID()}` as ApplicationRecord["id"], infrastructureId: infra.id, propertyId: input.propertyId as ApplicationRecord["propertyId"], type: input.type, displayName: input.displayName, publicUrl: input.publicUrl, adminUrl: input.adminUrl, status: "ACTIVE", requestedCapabilities: input.capabilities, grantedCapabilities: [], createdAt: at, updatedAt: at, applicationCredential: secret };
+      await client.query(`INSERT INTO ddi_applications (id, infrastructure_id, property_id, type, display_name, public_url, admin_url, status, requested_capabilities, granted_capabilities, credential_hash, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'[]'::jsonb,$10,$11,$11)`, [app.id, app.infrastructureId, app.propertyId ?? null, app.type, app.displayName, app.publicUrl ?? null, app.adminUrl ?? null, app.status, JSON.stringify(app.requestedCapabilities), credentialHash, at]);
       const relationId = `relationship:${randomUUID()}`;
       await client.query(`INSERT INTO ddi_relationships (id, source, target, relationship_type, status, metadata, created_at, updated_at) VALUES ($1,$2,$3,'APPLICATION','ACTIVE','{}'::jsonb,$4,$4)`, [relationId, app.id, infra.id, at]);
       await client.query(`UPDATE ddi_infrastructures SET updated_at = $2 WHERE id = $1`, [infra.id, at]);
       await client.query(`UPDATE ddi_idempotency SET response = $2::jsonb WHERE key = $1`, [key, JSON.stringify({ id: app.id })]);
       return app;
+    });
+  }
+
+  async provisionProperty(ownerId: DigiOwnerId, input: ProvisionPropertyInput): Promise<{ infrastructure: InfrastructureRecord; property: ConnectedProperty; created: boolean }> {
+    if (!input.idempotencyKey || !input.externalSystem || !input.externalReference || !input.displayName || !input.ownershipEvidence) throw new Error("INVALID_REQUEST");
+    // Reuse the canonical, race-safe PERSONAL PDI provisioner. Properties never create another PDI type.
+    const infrastructure = await this.provision(ownerId, { type: "PERSONAL", idempotencyKey: `property-pdi:${input.idempotencyKey}` });
+    return this.transaction(async client => {
+      const key = `property:${input.idempotencyKey}`;
+      await client.query(`INSERT INTO ddi_idempotency (key, owner_subject, owner_id, response, created_at) VALUES ($1, '', $2, '{}'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING`, [key, ownerId]);
+      const idempotency = await client.query<{ owner_id: string | null; response: { propertyId?: string } }>(`SELECT owner_id, response FROM ddi_idempotency WHERE key = $1 FOR UPDATE`, [key]);
+      if (!idempotency.rows[0] || idempotency.rows[0].owner_id !== ownerId) throw new Error("IDEMPOTENCY_OWNER_MISMATCH");
+      if (idempotency.rows[0].response?.propertyId) {
+        const property = await this.property(client, idempotency.rows[0].response.propertyId);
+        if (!property || property.infrastructureId !== infrastructure.id) throw new Error("IDEMPOTENCY_MISSING");
+        return { infrastructure, property, created: false };
+      }
+      const prior = await client.query<PropertyRow>(`SELECT id, infrastructure_id, owner_id, property_type, external_system, external_reference, display_name, status, ownership_evidence, created_at, updated_at, revoked_at FROM ddi_connected_properties WHERE external_system = $1 AND external_reference = $2 FOR UPDATE`, [input.externalSystem, input.externalReference]);
+      if (prior.rows[0]) {
+        const property = mapProperty(prior.rows[0]);
+        if (property.infrastructureId !== infrastructure.id || property.ownerId !== ownerId) throw new Error("PROPERTY_REFERENCE_CONFLICT");
+        await client.query(`UPDATE ddi_idempotency SET response = $2::jsonb WHERE key = $1`, [key, JSON.stringify({ propertyId: property.id })]);
+        return { infrastructure, property, created: false };
+      }
+      const at = new Date().toISOString();
+      const property: ConnectedProperty = { id: `property:${randomUUID()}` as ConnectedProperty["id"], infrastructureId: infrastructure.id, ownerId, type: input.type, externalSystem: input.externalSystem, externalReference: input.externalReference, displayName: input.displayName, status: "ACTIVE", ownershipEvidence: input.ownershipEvidence, createdAt: at, updatedAt: at };
+      await client.query(`INSERT INTO ddi_connected_properties (id, infrastructure_id, owner_id, property_type, external_system, external_reference, display_name, status, ownership_evidence, provisioning_idempotency_key, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE',$8,$9,$10,$10)`, [property.id, property.infrastructureId, ownerId, property.type, property.externalSystem, property.externalReference, property.displayName, property.ownershipEvidence, input.idempotencyKey, at]);
+      await this.connectionEvent(client, { eventType: "PROPERTY_CONNECTED", correlationId: input.idempotencyKey, ownerId, infrastructureId: property.infrastructureId, propertyId: property.id, result: "ACTIVE", timestamp: at });
+      await client.query(`UPDATE ddi_idempotency SET response = $2::jsonb WHERE key = $1`, [key, JSON.stringify({ propertyId: property.id })]);
+      return { infrastructure, property, created: true };
+    });
+  }
+
+  async getProperty(id: string) { return this.property(this.pool, id); }
+  async listProperties(infrastructureId: string) {
+    const result = await this.pool.query<PropertyRow>(`SELECT id, infrastructure_id, owner_id, property_type, external_system, external_reference, display_name, status, ownership_evidence, created_at, updated_at, revoked_at FROM ddi_connected_properties WHERE infrastructure_id = $1 ORDER BY created_at`, [infrastructureId]);
+    return result.rows.map(mapProperty);
+  }
+  async revokeProperty(ownerId: DigiOwnerId, id: string, _correlationId: string) {
+    return this.transaction(async client => {
+      const property = await this.property(client, id);
+      if (!property) throw new Error("PROPERTY_NOT_FOUND");
+      if (property.ownerId !== ownerId) throw new Error("OWNER_REQUIRED");
+      if (property.status === "REVOKED") return property;
+      const at = new Date().toISOString();
+      const result = await client.query<PropertyRow>(`UPDATE ddi_connected_properties SET status = 'REVOKED', revoked_at = $2, updated_at = $2 WHERE id = $1 RETURNING id, infrastructure_id, owner_id, property_type, external_system, external_reference, display_name, status, ownership_evidence, created_at, updated_at, revoked_at`, [id, at]);
+      const revoked = mapProperty(result.rows[0]!);
+      await this.connectionEvent(client, { eventType: "PROPERTY_REVOKED", correlationId: _correlationId, ownerId, infrastructureId: revoked.infrastructureId, propertyId: revoked.id, result: "REVOKED", timestamp: at });
+      return revoked;
     });
   }
 
@@ -212,7 +267,7 @@ export class PostgresDdiRepository implements DdiRepository {
     return result.rows[0] ? mapBinding(result.rows[0]) : null;
   }
   async insertAudit(audit: AuditRecord) {
-    await this.pool.query(`INSERT INTO ddi_audits (id, correlation_id, infrastructure_id, application_id, actor_subject, owner_id, audience, capability, action, resource, provider, grant_id, decision, reason, execution_mode, result, timestamp, connection_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, [randomUUID(), audit.correlationId, audit.infrastructureId, audit.applicationId, audit.actor ?? null, audit.ownerId ?? null, audit.audience, audit.capability, audit.action, audit.resource, audit.provider ?? null, audit.grantId ?? null, audit.decision, audit.reason ?? null, audit.executionMode, audit.result, audit.timestamp, audit.connectionId ?? null]);
+    await this.pool.query(`INSERT INTO ddi_audits (id, correlation_id, infrastructure_id, application_id, property_id, actor_subject, owner_id, audience, capability, action, resource, provider, grant_id, decision, reason, execution_mode, result, timestamp, connection_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, [randomUUID(), audit.correlationId, audit.infrastructureId, audit.applicationId, audit.propertyId ?? null, audit.actor ?? null, audit.ownerId ?? null, audit.audience, audit.capability, audit.action, audit.resource, audit.provider ?? null, audit.grantId ?? null, audit.decision, audit.reason ?? null, audit.executionMode, audit.result, audit.timestamp, audit.connectionId ?? null]);
   }
   async relationshipsFor(infrastructureId: string) {
     const result = await this.pool.query<RelationRow>(`SELECT id, source, target, relationship_type, created_at FROM ddi_relationships WHERE source = $1 OR target = $1 ORDER BY created_at`, [infrastructureId]);
@@ -221,10 +276,10 @@ export class PostgresDdiRepository implements DdiRepository {
   async snapshot(): Promise<PersistentState> {
     const [infras, apps, bindings, relations, audits] = await Promise.all([
       this.pool.query<InfraRow>(`SELECT id, owner_id, type, status, metadata, created_at, updated_at FROM ddi_infrastructures ORDER BY created_at`),
-      this.pool.query<AppRow>(`SELECT id, infrastructure_id, type, display_name, public_url, admin_url, status, requested_capabilities, granted_capabilities, created_at, updated_at FROM ddi_applications ORDER BY created_at`),
+      this.pool.query<AppRow>(`SELECT id, infrastructure_id, property_id, type, display_name, public_url, admin_url, status, requested_capabilities, granted_capabilities, created_at, updated_at FROM ddi_applications ORDER BY created_at`),
       this.pool.query<BindingRow>(`SELECT id, infrastructure_id, namespace, provider, configured, provider_reference FROM ddi_primitive_bindings`),
       this.pool.query<RelationRow>(`SELECT id, source, target, relationship_type, created_at FROM ddi_relationships ORDER BY created_at`),
-      this.pool.query<{ correlation_id: string; infrastructure_id: string; application_id: string; actor_subject: string | null; owner_id: string | null; audience: string; capability: string; action: string; resource: string; provider: string | null; grant_id: string | null; connection_id: string | null; decision: AuditRecord["decision"]; reason: string | null; execution_mode: AuditRecord["executionMode"]; result: AuditRecord["result"]; timestamp: Date }>(`SELECT correlation_id, infrastructure_id, application_id, actor_subject, owner_id, audience, capability, action, resource, provider, grant_id, connection_id, decision, reason, execution_mode, result, timestamp FROM ddi_audits ORDER BY timestamp`),
+      this.pool.query<{ correlation_id: string; infrastructure_id: string; application_id: string; property_id: string | null; actor_subject: string | null; owner_id: string | null; audience: string; capability: string; action: string; resource: string; provider: string | null; grant_id: string | null; connection_id: string | null; decision: AuditRecord["decision"]; reason: string | null; execution_mode: AuditRecord["executionMode"]; result: AuditRecord["result"]; timestamp: Date }>(`SELECT correlation_id, infrastructure_id, application_id, property_id, actor_subject, owner_id, audience, capability, action, resource, provider, grant_id, connection_id, decision, reason, execution_mode, result, timestamp FROM ddi_audits ORDER BY timestamp`),
     ]);
     const applications = apps.rows.map(mapApp);
     const primitiveBindings = bindings.rows.map(mapBinding);
@@ -232,7 +287,7 @@ export class PostgresDdiRepository implements DdiRepository {
     const infrastructures = await Promise.all(infras.rows.map(row => this.assemble(row, applications, primitiveBindings, relationships)));
     const connections = (await this.pool.query<ConnectionRow>(`SELECT id, infrastructure_id, application_id, owner_id, status, requested_capabilities, approved_capabilities, pending_capabilities, authority_grant_refs, revision, created_at, updated_at, approved_at, revoked_at FROM ddi_connections ORDER BY created_at`)).rows.map(mapConnection);
     const connectionAudits = await this.connectionAudits();
-    return { infrastructures, applications, bindings: primitiveBindings, relationships, connections, connectionAudits, audits: audits.rows.map(row => ({ timestamp: iso(row.timestamp), correlationId: row.correlation_id, infrastructureId: row.infrastructure_id as AuditRecord["infrastructureId"], applicationId: row.application_id as AuditRecord["applicationId"], ownerId: (row.owner_id ?? undefined) as DigiOwnerId | undefined, actor: row.actor_subject ?? undefined, audience: row.audience, capability: row.capability as AuditRecord["capability"], action: row.action, resource: row.resource, provider: (row.provider ?? undefined) as AuditRecord["provider"], grantId: row.grant_id ?? undefined, connectionId: (row.connection_id ?? undefined) as AuditRecord["connectionId"], decision: row.decision, reason: row.reason ?? undefined, executionMode: row.execution_mode, result: row.result })), idempotency: {} };
+    return { infrastructures, applications, properties: [], bindings: primitiveBindings, relationships, connections, connectionAudits, audits: audits.rows.map(row => ({ timestamp: iso(row.timestamp), correlationId: row.correlation_id, infrastructureId: row.infrastructure_id as AuditRecord["infrastructureId"], applicationId: row.application_id as AuditRecord["applicationId"], propertyId: (row.property_id ?? undefined) as AuditRecord["propertyId"], ownerId: (row.owner_id ?? undefined) as DigiOwnerId | undefined, actor: row.actor_subject ?? undefined, audience: row.audience, capability: row.capability as AuditRecord["capability"], action: row.action, resource: row.resource, provider: (row.provider ?? undefined) as AuditRecord["provider"], grantId: row.grant_id ?? undefined, connectionId: (row.connection_id ?? undefined) as AuditRecord["connectionId"], decision: row.decision, reason: row.reason ?? undefined, executionMode: row.execution_mode, result: row.result })), idempotency: {} };
   }
 
   async findPersonal(ownerId: DigiOwnerId, ownerTrustId?: string) {
@@ -255,9 +310,13 @@ export class PostgresDdiRepository implements DdiRepository {
     const result = await this.pool.query<ConnectionRow>(`SELECT id, infrastructure_id, application_id, owner_id, status, requested_capabilities, approved_capabilities, pending_capabilities, authority_grant_refs, revision, created_at, updated_at, approved_at, revoked_at FROM ddi_connections WHERE infrastructure_id = $1 ORDER BY created_at`, [infrastructureId]);
     return result.rows.map(mapConnection);
   }
+  async listConnectionsForProperty(propertyId: string) {
+    const result = await this.pool.query<ConnectionRow>(`SELECT c.id, c.infrastructure_id, c.application_id, c.owner_id, c.status, c.requested_capabilities, c.approved_capabilities, c.pending_capabilities, c.authority_grant_refs, c.revision, c.created_at, c.updated_at, c.approved_at, c.revoked_at FROM ddi_connections c JOIN ddi_applications a ON a.id = c.application_id WHERE a.property_id = $1 ORDER BY c.created_at`, [propertyId]);
+    return result.rows.map(mapConnection);
+  }
   async connectionAudits() {
-    const result = await this.pool.query<{ event_type: ConnectionAuditRecord["eventType"]; correlation_id: string; owner_id: string | null; infrastructure_id: string; application_id: string | null; connection_id: string | null; capability: string | null; grant_id: string | null; result: string; reason: string | null; timestamp: Date }>(`SELECT event_type, correlation_id, owner_id, infrastructure_id, application_id, connection_id, capability, grant_id, result, reason, timestamp FROM ddi_connection_audits ORDER BY timestamp`);
-    return result.rows.map(row => ({ eventType: row.event_type, correlationId: row.correlation_id, ownerId: (row.owner_id ?? undefined) as DigiOwnerId | undefined, infrastructureId: row.infrastructure_id as ConnectionAuditRecord["infrastructureId"], applicationId: (row.application_id ?? undefined) as ConnectionAuditRecord["applicationId"], connectionId: (row.connection_id ?? undefined) as ConnectionAuditRecord["connectionId"], capability: (row.capability ?? undefined) as Capability | undefined, grantId: row.grant_id ?? undefined, result: row.result, reason: row.reason ?? undefined, timestamp: iso(row.timestamp) }));
+    const result = await this.pool.query<{ event_type: ConnectionAuditRecord["eventType"]; correlation_id: string; owner_id: string | null; infrastructure_id: string; property_id: string | null; application_id: string | null; connection_id: string | null; capability: string | null; grant_id: string | null; result: string; reason: string | null; timestamp: Date }>(`SELECT event_type, correlation_id, owner_id, infrastructure_id, property_id, application_id, connection_id, capability, grant_id, result, reason, timestamp FROM ddi_connection_audits ORDER BY timestamp`);
+    return result.rows.map(row => ({ eventType: row.event_type, correlationId: row.correlation_id, ownerId: (row.owner_id ?? undefined) as DigiOwnerId | undefined, infrastructureId: row.infrastructure_id as ConnectionAuditRecord["infrastructureId"], propertyId: (row.property_id ?? undefined) as ConnectionAuditRecord["propertyId"], applicationId: (row.application_id ?? undefined) as ConnectionAuditRecord["applicationId"], connectionId: (row.connection_id ?? undefined) as ConnectionAuditRecord["connectionId"], capability: (row.capability ?? undefined) as Capability | undefined, grantId: row.grant_id ?? undefined, result: row.result, reason: row.reason ?? undefined, timestamp: iso(row.timestamp) }));
   }
   async requestConnection(applicationId: string, capabilities: Capability[], correlationId: string, idempotencyKey: string) {
     if (!capabilities.length || !idempotencyKey) throw new Error("INVALID_REQUEST");
@@ -324,10 +383,12 @@ export class PostgresDdiRepository implements DdiRepository {
         throw new Error("CONNECTION_NOT_APPROVABLE");
       }
       const allowed = current.status === "REQUESTED" ? current.requestedCapabilities : current.pendingCapabilities;
+      const application = await this.application(client, current.applicationId);
+      if (!application) throw new Error("UNKNOWN_APPLICATION");
       assertCapabilitySubset(capabilities, allowed);
       const refs: AuthorityGrantRef[] = [];
       for (const capability of capabilities) {
-        const binding = authorityBinding(current.applicationId, current.infrastructureId, capability);
+        const binding = authorityBinding(current.applicationId, current.infrastructureId, capability, application.propertyId);
         let grantId: string;
         try { grantId = (await grants.ensureGrant({ ownerId, actor: binding.actor, action: binding.action, resource: binding.resource, audience: binding.audience, sessionToken })).grantId; }
         catch (error) { if (error instanceof Error && /^[A-Z0-9_]+$/.test(error.message)) throw error; throw new Error("AUTHORITY_GRANT_UNAVAILABLE"); }
@@ -388,13 +449,13 @@ export class PostgresDdiRepository implements DdiRepository {
     return result.rows[0] ? mapConnection(result.rows[0]) : null;
   }
   private async connectionEvent(client: PoolClient, event: ConnectionAuditRecord) {
-    await client.query(`INSERT INTO ddi_connection_audits (id, event_type, correlation_id, owner_id, infrastructure_id, application_id, connection_id, capability, grant_id, result, reason, timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [randomUUID(), event.eventType, event.correlationId, event.ownerId ?? null, event.infrastructureId, event.applicationId ?? null, event.connectionId ?? null, event.capability ?? null, event.grantId ?? null, event.result, event.reason ?? null, event.timestamp]);
+    await client.query(`INSERT INTO ddi_connection_audits (id, event_type, correlation_id, owner_id, infrastructure_id, property_id, application_id, connection_id, capability, grant_id, result, reason, timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, [randomUUID(), event.eventType, event.correlationId, event.ownerId ?? null, event.infrastructureId, event.propertyId ?? null, event.applicationId ?? null, event.connectionId ?? null, event.capability ?? null, event.grantId ?? null, event.result, event.reason ?? null, event.timestamp]);
   }
   private async hydrate(client: Pool | PoolClient, id: string) {
     const result = await client.query<InfraRow>(`SELECT id, owner_id, type, status, metadata, created_at, updated_at FROM ddi_infrastructures WHERE id = $1`, [id]);
     const row = result.rows[0];
     if (!row?.owner_id) return null;
-    const apps = await client.query<AppRow>(`SELECT id, infrastructure_id, type, display_name, public_url, admin_url, status, requested_capabilities, granted_capabilities, created_at, updated_at FROM ddi_applications WHERE infrastructure_id = $1`, [id]);
+    const apps = await client.query<AppRow>(`SELECT id, infrastructure_id, property_id, type, display_name, public_url, admin_url, status, requested_capabilities, granted_capabilities, created_at, updated_at FROM ddi_applications WHERE infrastructure_id = $1`, [id]);
     const bindings = await client.query<BindingRow>(`SELECT id, infrastructure_id, namespace, provider, configured, provider_reference FROM ddi_primitive_bindings WHERE infrastructure_id = $1`, [id]);
     const relations = await client.query<RelationRow>(`SELECT id, source, target, relationship_type, created_at FROM ddi_relationships WHERE source = $1 OR target = $1`, [id]);
     return this.assemble(row, apps.rows.map(mapApp), bindings.rows.map(mapBinding), relations.rows.map(mapRelation));
@@ -403,8 +464,12 @@ export class PostgresDdiRepository implements DdiRepository {
     return { id: row.id as InfrastructureRecord["id"], ownerId: row.owner_id as DigiOwnerId, type: row.type, status: row.status, applicationIds: applications.filter(app => app.infrastructureId === row.id).map(app => app.id), primitiveBindingIds: bindings.filter(binding => binding.infrastructureId === row.id).map(binding => binding.id), relationshipIds: relationships.filter(relation => relation.from === row.id || relation.to === row.id).map(relation => relation.id), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), metadata: row.metadata ?? {} };
   }
   private async application(client: Pool | PoolClient, id: string) {
-    const result = await client.query<AppRow>(`SELECT id, infrastructure_id, type, display_name, public_url, admin_url, status, requested_capabilities, granted_capabilities, created_at, updated_at FROM ddi_applications WHERE id = $1`, [id]);
+    const result = await client.query<AppRow>(`SELECT id, infrastructure_id, property_id, type, display_name, public_url, admin_url, status, requested_capabilities, granted_capabilities, created_at, updated_at FROM ddi_applications WHERE id = $1`, [id]);
     return result.rows[0] ? mapApp(result.rows[0]) : null;
+  }
+  private async property(client: Pool | PoolClient, id: string) {
+    const result = await client.query<PropertyRow>(`SELECT id, infrastructure_id, owner_id, property_type, external_system, external_reference, display_name, status, ownership_evidence, created_at, updated_at, revoked_at FROM ddi_connected_properties WHERE id = $1`, [id]);
+    return result.rows[0] ? mapProperty(result.rows[0]) : null;
   }
 }
 
@@ -413,7 +478,10 @@ function mapConnection(row: ConnectionRow): PdiApplicationConnection {
   return { id: row.id as PdiApplicationConnection["id"], infrastructureId: row.infrastructure_id as PdiApplicationConnection["infrastructureId"], applicationId: row.application_id as PdiApplicationConnection["applicationId"], ownerId: row.owner_id as DigiOwnerId, status: row.status, requestedCapabilities: row.requested_capabilities, approvedCapabilities: row.approved_capabilities, pendingCapabilities: row.pending_capabilities, authorityGrantRefs: row.authority_grant_refs, revision: row.revision, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), approvedAt: row.approved_at ? iso(row.approved_at) : undefined, revokedAt: row.revoked_at ? iso(row.revoked_at) : undefined };
 }
 function mapApp(row: AppRow): ApplicationRecord {
-  return { id: row.id as ApplicationRecord["id"], infrastructureId: row.infrastructure_id as ApplicationRecord["infrastructureId"], type: row.type, displayName: row.display_name, publicUrl: row.public_url ?? undefined, adminUrl: row.admin_url ?? undefined, status: row.status, requestedCapabilities: row.requested_capabilities, grantedCapabilities: row.granted_capabilities, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  return { id: row.id as ApplicationRecord["id"], infrastructureId: row.infrastructure_id as ApplicationRecord["infrastructureId"], propertyId: (row.property_id ?? undefined) as ApplicationRecord["propertyId"], type: row.type, displayName: row.display_name, publicUrl: row.public_url ?? undefined, adminUrl: row.admin_url ?? undefined, status: row.status, requestedCapabilities: row.requested_capabilities, grantedCapabilities: row.granted_capabilities, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+}
+function mapProperty(row: PropertyRow): ConnectedProperty {
+  return { id: row.id as ConnectedProperty["id"], infrastructureId: row.infrastructure_id as ConnectedProperty["infrastructureId"], ownerId: row.owner_id as DigiOwnerId, type: row.property_type, externalSystem: row.external_system, externalReference: row.external_reference, displayName: row.display_name, status: row.status, ownershipEvidence: row.ownership_evidence, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), revokedAt: row.revoked_at ? iso(row.revoked_at) : undefined };
 }
 function mapBinding(row: BindingRow): PrimitiveBinding {
   const reference = row.provider_reference ?? undefined;
