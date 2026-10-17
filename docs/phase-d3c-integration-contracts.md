@@ -139,7 +139,7 @@ not published must be rejected at configuration review.
 ## Master Distributor gaps (inspected at `541734e`)
 
 - Auth: HS256 JWTs with a shared `TRUST_ID_JWT_SECRET` (default
-  `dev-trust-id-secret-change-me`) whose roles are self-asserted claims; not TrustID.
+  `a committed development literal, not reproduced here`) whose roles are self-asserted claims; not TrustID.
 - `ENABLE_GUEST_DOWNLOADS` defaults to `true`: `/downloads/:appId/latest` hands out
   any app's latest binary without authentication, bypassing any licensing.
 - `checksumSha256` is optional at publish and is filled with a random digest when
