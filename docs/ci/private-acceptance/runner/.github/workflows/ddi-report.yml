@@ -1,0 +1,79 @@
+# DDI private acceptance report (Stage 5D). Credentialed: the only workflow that can publish to DDI, and
+# the only one that references the DDI reporter App key. It cannot be started on request: it runs from
+# main when GitHub records a completed "DDI private acceptance" run.
+#
+# - scripts/chain.mjs reads GitHub's records only (the run, its jobs, the Portal snapshot run, the
+#   public pull request). Nothing from the acceptance run is downloaded or executed.
+# - The reporter token (checks write, DDI only, revoked when the job ends) is minted only after that
+#   check passes.
+# - Re-runs of this report, superseded attempts, runs older than 24 hours, other runner commits, other
+#   workflows, non-maintainer runs and moved pull requests publish nothing; the required check then
+#   stays absent and the merge stays blocked.
+# - The check posts success only if the run, both of its jobs and its Portal snapshot run succeeded;
+#   anything else posts failure.
+name: DDI private acceptance report
+
+on:
+  workflow_run:
+    workflows:
+      - DDI private acceptance
+    types:
+      - completed
+
+permissions: {}
+
+concurrency:
+  group: ddi-private-acceptance-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: runner
+          sparse-checkout: |
+            scripts
+            .github/workflows
+          persist-credentials: false
+      - name: Verify the chain (GitHub's records only)
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node runner/scripts/chain.mjs report
+      - name: Reporter token (checks write, DDI only, revoked when the job ends)
+        id: reporter
+        uses: actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b # v2.1.1
+        with:
+          app-id: ${{ vars.DDI_REPORTER_APP_ID }}
+          private-key: ${{ secrets.DDI_REPORTER_PRIVATE_KEY }}
+          owner: okoro0704-del
+          repositories: DDI
+          permission-checks: write
+      - name: Report ddi-private-acceptance on the accepted head commit
+        env:
+          GH_TOKEN: ${{ steps.reporter.outputs.token }}
+          CONCLUSION: ${{ steps.verify.outputs.conclusion }}
+          VERDICT: ${{ steps.verify.outputs.verdict }}
+          PR: ${{ steps.verify.outputs.pr }}
+          BASE: ${{ steps.verify.outputs.base }}
+          HEAD_SHA: ${{ steps.verify.outputs.head_sha }}
+          BASE_SHA: ${{ steps.verify.outputs.base_sha }}
+          ACCEPTANCE_RUN: ${{ steps.verify.outputs.acceptance_run }}
+          SNAPSHOT_RUN: ${{ steps.verify.outputs.snapshot_run }}
+          CHAIN_COMMIT: ${{ steps.verify.outputs.runner_sha }}
+          PINS: ${{ steps.verify.outputs.pins }}
+        run: |
+          set -euo pipefail
+          [[ "$CONCLUSION" =~ ^(success|failure)$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$CHAIN_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR" =~ ^[1-9][0-9]{0,5}$ && "$BASE" =~ ^(master|pdi)$ && "$ACCEPTANCE_RUN" =~ ^[1-9][0-9]{0,19}$ && "$SNAPSHOT_RUN" =~ ^[1-9][0-9]{0,19}$ ]]
+          summary="PR #$PR into $BASE at head $HEAD_SHA (base $BASE_SHA). Pins: $PINS. Runner $CHAIN_COMMIT; acceptance run $ACCEPTANCE_RUN; Portal snapshot run $SNAPSHOT_RUN. Verdict: $VERDICT."
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          gh api --method POST repos/okoro0704-del/DDI/check-runs --silent -f name=ddi-private-acceptance -f head_sha="$HEAD_SHA" -f status=completed -f conclusion="$CONCLUSION" -f external_id="$ACCEPTANCE_RUN" -f "output[title]=DDI private acceptance $CONCLUSION" -f "output[summary]=$summary"

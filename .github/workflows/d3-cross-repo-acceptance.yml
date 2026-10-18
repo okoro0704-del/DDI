@@ -9,7 +9,8 @@
 # - every database is a disposable PostgreSQL 16 service container on loopback; the safety gate refuses
 #   any non-loopback or hosted endpoint, any credential-shaped variable and any unpinned checkout.
 # Sibling repositories are public and pinned to full commit SHAs; bump a pin only after that commit is
-# reviewed, together with the same pin in docs/ci/private-acceptance/ddi-private-acceptance.yml.
+# reviewed, together with the same pin in the private runner's acceptance workflow
+# (docs/ci/private-acceptance/runner/.github/workflows/ddi-acceptance.yml).
 # LifeOS Portal is private, so the Portal suites and the D3 end-to-end acceptance run only in the private
 # acceptance runner (docs/phase-d3d-a-private-acceptance.md), which reports to DDI as the check
 # `ddi-private-acceptance` from its own GitHub App; nothing here can fetch Portal or report that check.

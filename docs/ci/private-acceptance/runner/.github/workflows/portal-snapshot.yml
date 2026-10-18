@@ -1,0 +1,69 @@
+# DDI acceptance Portal snapshot (Stage 5D). Credentialed: the only workflow that can read LifeOS Portal,
+# and the only one that references the Portal reader App key. It runs no Portal or DDI code.
+#
+# - Started by hand from main by a maintainer; anything else stops before a credential is used.
+# - The Portal reader token (contents read, LifeOS-Portal only, revoked when the job ends) checks out
+#   the owner-approved ref PORTAL_REF, which must resolve to PORTAL_SHA with tree PORTAL_TREE.
+# - Uploads one artifact: the commit's tracked files (no history, no credentials), kept 7 days. The
+#   acceptance workflow accepts it only from a successful maintainer run of this file at its own runner
+#   commit, and verifies it again against PORTAL_TREE.
+name: DDI acceptance Portal snapshot
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ddi-acceptance-portal-snapshot
+  cancel-in-progress: false
+
+env:
+  PORTAL_SHA: 316a07b7ad94f5a5eacff790906aa879537439ef
+  PORTAL_TREE: e354ae4f3cdf2308a373805f7d1f403685f4253f
+  PORTAL_REF: refs/tags/ddi-acceptance/316a07b
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Maintainer dispatch from main only
+        env:
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Portal snapshot::$1"; exit 1; }
+          [ "$REF" = refs/heads/main ] || fail "dispatch from main only"
+          [ "$ACTOR" = okoro0704-del ] || fail "only a maintainer may dispatch"
+      - name: Portal read token (contents read, the Portal repository only, revoked when the job ends)
+        id: portal-reader
+        uses: actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b # v2.1.1
+        with:
+          app-id: ${{ vars.PORTAL_READER_APP_ID }}
+          private-key: ${{ secrets.PORTAL_READER_PRIVATE_KEY }}
+          owner: okoro0704-del
+          repositories: LifeOS-Portal
+          permission-contents: read
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: okoro0704-del/LifeOS-Portal
+          ref: ${{ env.PORTAL_REF }}
+          token: ${{ steps.portal-reader.outputs.token }}
+          path: portal
+          persist-credentials: false
+      - name: Archive the pinned commit (tracked files only; no history, no credentials)
+        run: |
+          set -euo pipefail
+          [ "$(git -C portal rev-parse HEAD)" = "$PORTAL_SHA" ]
+          [ "$(git -C portal rev-parse 'HEAD^{tree}')" = "$PORTAL_TREE" ]
+          git -C portal -c core.autocrlf=false archive --format=tar --prefix=portal/ "$PORTAL_SHA" | gzip -n > portal.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portal-source-${{ env.PORTAL_SHA }}
+          path: portal.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0

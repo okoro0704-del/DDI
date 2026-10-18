@@ -1,22 +1,17 @@
-# DDI private acceptance (Stage 5C). Not a DDI workflow: this is the template of
-# .github/workflows/ddi-private-acceptance.yml in the private repository
-# okoro0704-del/ddi-private-acceptance, which must hold it byte-for-byte (the run refuses a candidate whose
-# copy differs). scripts/ci/assert-private-acceptance.mjs reviews it in every DDI test run.
+# DDI private acceptance (Stage 5D). Runs the untrusted DDI candidate. It references no secret and no
+# variable, so none of this repository's secrets are held for it (GitHub scrubs secrets "not referenced
+# in the workflow"). Every job token is read-only or empty, and nothing here can publish a result.
 #
-# Trust boundary (docs/phase-d3d-a-private-acceptance.md):
-# - Started by hand only (workflow_dispatch from main), by the runner repository's sole maintainer, for
-#   one DDI pull request at one reviewed head commit. Nothing a pull request does can start it.
-# - Credentials exist only in `fetch-portal` and `report`, as secrets of two environments that only
-#   those jobs use and that only main may deploy to. Neither job runs DDI or Portal code, and each App
-#   token is scoped to one repository and one permission and revoked when its job ends.
-# - `acceptance` runs the candidate with no secrets, no environment and no token permissions. It
-#   receives the Portal source as an archive whose digest and git tree hash it verifies first.
-# - The result reaches DDI only as the check run `ddi-private-acceptance`, created by the reporter App;
-#   the DDI ruleset requires that check from that App alone, so no DDI workflow can stand in for it.
-# - Logs and the one-day archive stay in the private repository. No caches, no other artifacts, no
-#   deployment, no hosted endpoints; databases are disposable loopback PostgreSQL containers.
+# - resolve (contents and actions read; no candidate code): maintainer dispatch from main. The pull
+#   request is open, from okoro0704-del/DDI, at the reviewed head, on the reviewed base tip, up to date.
+#   This runner's tree equals the candidate's docs/ci/private-acceptance/runner (a candidate from before
+#   it existed must declare every pin instead). The Portal snapshot run is a genuine maintainer run of
+#   portal-snapshot.yml at this runner commit, and its archive reproduces PORTAL_TREE.
+# - acceptance (no permissions, no secrets): refuses credential-shaped variables, re-derives the merge
+#   tree, verifies the archive's digest and tree, then runs every suite on loopback PostgreSQL.
+# ddi-report.yml reads only GitHub's record of these jobs once this run completes.
 name: DDI private acceptance
-run-name: ddi-private-acceptance pr=${{ inputs.pr }} head=${{ inputs.head_sha }} base=${{ inputs.base }}
+run-name: ddi-acceptance pr=${{ inputs.pr }} head=${{ inputs.head_sha }} base=${{ inputs.base }} base_sha=${{ inputs.base_sha }} portal_run=${{ inputs.portal_run }}
 
 on:
   workflow_dispatch:
@@ -36,6 +31,14 @@ on:
         options:
           - master
           - pdi
+      base_sha:
+        description: Reviewed tip of the base branch (full SHA)
+        required: true
+        type: string
+      portal_run:
+        description: Run id of a successful Portal snapshot at this runner commit
+        required: true
+        type: string
 
 permissions: {}
 
@@ -51,39 +54,43 @@ env:
   ELFCOM_SHA: f0b7e7213e4b0c8bf0efe560212ec1cd3764bdbf
 
 jobs:
-  # No credential beyond this repository's read-only token; no candidate code runs.
+  # Read-only token; no candidate code runs.
   resolve:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
+      actions: read
     outputs:
       head_sha: ${{ steps.resolve.outputs.head_sha }}
       base_sha: ${{ steps.resolve.outputs.base_sha }}
       merge_tree: ${{ steps.resolve.outputs.merge_tree }}
-      workflow_blob: ${{ steps.resolve.outputs.workflow_blob }}
+      portal_sha256: ${{ steps.snapshot.outputs.portal_sha256 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.workflow_sha }}
           path: runner
-          sparse-checkout: .github/workflows
           persist-credentials: false
       - name: Resolve the reviewed candidate and check its pins (data only)
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           REF: ${{ github.ref }}
+          ACTOR: ${{ github.triggering_actor }}
           PR: ${{ inputs.pr }}
           HEAD_SHA: ${{ inputs.head_sha }}
           BASE: ${{ inputs.base }}
+          BASE_SHA: ${{ inputs.base_sha }}
         run: |
           set -euo pipefail
           fail() { echo "::error title=DDI private acceptance::$1"; exit 1; }
           [ "$REF" = refs/heads/main ] || fail "dispatch from main only"
+          [ "$ACTOR" = okoro0704-del ] || fail "only a maintainer may dispatch"
           [[ "$PR" =~ ^[1-9][0-9]{0,5}$ ]] || fail "pr must be a pull request number"
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "head_sha must be a full commit SHA"
           [[ "$BASE" =~ ^(master|pdi)$ ]] || fail "base must be master or pdi"
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "base_sha must be a full commit SHA"
           pr_fields=$(gh api "repos/okoro0704-del/DDI/pulls/$PR" --jq '[.state, .head.repo.full_name, .base.ref, .head.sha] | @tsv')
           IFS=$'\t' read -r state head_repo base_ref pr_head <<<"$pr_fields"
           [ "$state" = open ] || fail "pull request $PR is not open"
@@ -92,64 +99,51 @@ jobs:
           [ "$pr_head" = "$HEAD_SHA" ] || fail "pull request $PR has moved past $HEAD_SHA; review the new head and dispatch again"
           git init -q ddi
           git -C ddi fetch -q --no-tags https://github.com/okoro0704-del/DDI.git "$HEAD_SHA" "+refs/heads/$BASE:refs/remotes/origin/$BASE"
-          base_sha=$(git -C ddi rev-parse "refs/remotes/origin/$BASE")
-          git -C ddi merge-base --is-ancestor "$base_sha" "$HEAD_SHA" || fail "the pull request is behind $BASE; update it, review the new head and dispatch again"
-          merge_tree=$(git -C ddi merge-tree --write-tree "$base_sha" "$HEAD_SHA") || fail "the candidate does not merge cleanly into $BASE"
+          base_tip=$(git -C ddi rev-parse "refs/remotes/origin/$BASE")
+          [ "$base_tip" = "$BASE_SHA" ] || fail "$BASE is at $base_tip, not the reviewed $BASE_SHA; review again and dispatch with the current tip"
+          git -C ddi merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA" || fail "the pull request is behind $BASE; update it, review the new head and dispatch again"
+          merge_tree=$(git -C ddi merge-tree --write-tree "$BASE_SHA" "$HEAD_SHA") || fail "the candidate does not merge cleanly into $BASE"
           [ "$merge_tree" = "$(git -C ddi rev-parse "$HEAD_SHA^{tree}")" ] || fail "the merge tree differs from the head tree"
-          own=runner/.github/workflows/ddi-private-acceptance.yml
-          template=docs/ci/private-acceptance/ddi-private-acceptance.yml
-          has_template=false
-          if git -C ddi cat-file -e "$HEAD_SHA:$template" 2>/dev/null; then
-            git -C ddi show "$HEAD_SHA:$template" | cmp -s - "$own" || fail "this runner's workflow differs from the candidate's $template"
-            has_template=true
+          mirror=docs/ci/private-acceptance/runner
+          runner_tree=$(git -C runner rev-parse 'HEAD^{tree}')
+          candidate_tree=$(git -C ddi rev-parse -q --verify "$HEAD_SHA:$mirror" || true)
+          if [ -n "$candidate_tree" ]; then
+            [ "$candidate_tree" = "$runner_tree" ] || fail "this runner ($runner_tree) differs from the candidate's $mirror ($candidate_tree)"
           fi
           git -C ddi show "$HEAD_SHA:.github/workflows/d3-cross-repo-acceptance.yml" > public.yml || fail "the candidate has no d3-cross-repo-acceptance.yml"
           for pin in PORTAL_SHA MD_SHA TRUSTID_SHA ELFCOM_SHA; do
             declared=$(sed -nE "s/^  $pin: ([0-9a-f]{40})$/\1/p" public.yml)
-            if [ -z "$declared" ] && [ "$pin" = PORTAL_SHA ] && [ "$has_template" = true ]; then continue; fi
+            if [ -z "$declared" ] && [ "$pin" = PORTAL_SHA ] && [ -n "$candidate_tree" ]; then continue; fi
             [ "$declared" = "${!pin}" ] || fail "the candidate pins $pin=${declared:-none}; this runner pins ${!pin}"
           done
           {
             echo "head_sha=$HEAD_SHA"
-            echo "base_sha=$base_sha"
+            echo "base_sha=$BASE_SHA"
             echo "merge_tree=$merge_tree"
-            echo "workflow_blob=$(git hash-object "$own")"
           } >> "$GITHUB_OUTPUT"
-
-  # Credentialed: reads the pinned Portal commit. Runs no Portal or DDI code.
-  fetch-portal:
-    needs: resolve
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    environment: ddi-acceptance-portal-read
-    permissions: {}
-    outputs:
-      archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
-    steps:
-      - name: Portal read token (contents read, the Portal repository only, revoked when the job ends)
-        id: portal-reader
-        uses: actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b # v2.1.1
+      - name: Check the Portal snapshot run (GitHub's records only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PORTAL_RUN: ${{ inputs.portal_run }}
+        run: node runner/scripts/chain.mjs portal-run
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          app-id: ${{ vars.PORTAL_READER_APP_ID }}
-          private-key: ${{ secrets.PORTAL_READER_PRIVATE_KEY }}
-          owner: okoro0704-del
-          repositories: LifeOS-Portal
-          permission-contents: read
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: okoro0704-del/LifeOS-Portal
-          ref: ${{ env.PORTAL_SHA }}
-          token: ${{ steps.portal-reader.outputs.token }}
-          path: portal
-          persist-credentials: false
-      - name: Archive the pinned commit (tracked files only; no history, no credentials)
-        id: archive
+          name: portal-source-${{ env.PORTAL_SHA }}
+          path: portal-snapshot
+          run-id: ${{ inputs.portal_run }}
+          github-token: ${{ github.token }}
+      - name: Verify the snapshot against the pinned tree
+        id: snapshot
         run: |
           set -euo pipefail
-          [ "$(git -C portal rev-parse HEAD)" = "$PORTAL_SHA" ]
-          [ "$(git -C portal rev-parse 'HEAD^{tree}')" = "$PORTAL_TREE" ]
-          git -C portal -c core.autocrlf=false archive --format=tar --prefix=portal/ "$PORTAL_SHA" | gzip -n > portal.tar.gz
-          echo "archive_sha256=$(sha256sum portal.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          mkdir check
+          tar -xzf portal-snapshot/portal.tar.gz -C check
+          [ ! -e check/portal/.git ]
+          git init -q check/portal
+          git -C check/portal -c core.autocrlf=false add -A -f
+          [ "$(git -C check/portal write-tree)" = "$PORTAL_TREE" ]
+          cp portal-snapshot/portal.tar.gz portal.tar.gz
+          echo "portal_sha256=$(sha256sum portal.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: portal-source
@@ -158,9 +152,9 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  # Untrusted candidate code: no secrets, no environment, no token permissions.
+  # Untrusted candidate code: no secrets, no token permissions, no outputs.
   acceptance:
-    needs: [resolve, fetch-portal]
+    needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions: {}
@@ -182,7 +176,7 @@ jobs:
       HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
       BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
       MERGE_TREE: ${{ needs.resolve.outputs.merge_tree }}
-      PORTAL_ARCHIVE_SHA256: ${{ needs.fetch-portal.outputs.archive_sha256 }}
+      PORTAL_ARCHIVE_SHA256: ${{ needs.resolve.outputs.portal_sha256 }}
       NODE_ENV: test
       PGBASE: postgresql://d3_test:${{ github.run_id }}@127.0.0.1:5432
       DDI_TEST_DATABASE_URL: postgresql://d3_test:${{ github.run_id }}@127.0.0.1:5432/ddi_test
@@ -295,45 +289,3 @@ jobs:
           PORTAL_E2E_DATABASE_URL: ${{ env.PGBASE }}/portal_d3da
           MD_E2E_DATABASE_URL: ${{ env.PGBASE }}/md_d3da
         run: node --import tsx --test --test-concurrency=1 --test-timeout=300000 ../ddi/tests/e2e/d3da-crash-recovery.e2e.ts
-
-  # Credentialed: reports the result to DDI. Reads job results and resolve's verified values only,
-  # never anything the candidate produced.
-  report:
-    needs: [resolve, fetch-portal, acceptance]
-    if: always() && needs.resolve.result == 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    environment: ddi-acceptance-report
-    permissions: {}
-    steps:
-      - name: Reporter token (checks write, DDI only, revoked when the job ends)
-        id: reporter
-        uses: actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b # v2.1.1
-        with:
-          app-id: ${{ vars.DDI_REPORTER_APP_ID }}
-          private-key: ${{ secrets.DDI_REPORTER_PRIVATE_KEY }}
-          owner: okoro0704-del
-          repositories: DDI
-          permission-checks: write
-      - name: Report ddi-private-acceptance on the accepted head commit
-        env:
-          GH_TOKEN: ${{ steps.reporter.outputs.token }}
-          PR: ${{ inputs.pr }}
-          BASE: ${{ inputs.base }}
-          HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
-          BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
-          MERGE_TREE: ${{ needs.resolve.outputs.merge_tree }}
-          WORKFLOW_BLOB: ${{ needs.resolve.outputs.workflow_blob }}
-          WORKFLOW_SHA: ${{ github.workflow_sha }}
-          FETCH_RESULT: ${{ needs.fetch-portal.result }}
-          ACCEPTANCE_RESULT: ${{ needs.acceptance.result }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          [[ "$PR" =~ ^[1-9][0-9]{0,5}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$MERGE_TREE" =~ ^[0-9a-f]{40}$ ]]
-          conclusion=failure
-          if [ "$FETCH_RESULT" = success ] && [ "$ACCEPTANCE_RESULT" = success ]; then conclusion=success; fi
-          summary="PR #$PR into $BASE at head $HEAD_SHA (base $BASE_SHA, merge tree $MERGE_TREE). Pins: Portal $PORTAL_SHA (tree $PORTAL_TREE), Master Distributor $MD_SHA, TrustID $TRUSTID_SHA, ElfCom $ELFCOM_SHA. Runner workflow blob $WORKFLOW_BLOB at $WORKFLOW_SHA, run $RUN_ID attempt $RUN_ATTEMPT. Portal fetch $FETCH_RESULT, acceptance $ACCEPTANCE_RESULT."
-          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
-          gh api --method POST repos/okoro0704-del/DDI/check-runs --silent -f name=ddi-private-acceptance -f head_sha="$HEAD_SHA" -f status=completed -f conclusion="$conclusion" -f external_id="$RUN_ID" -f "output[title]=DDI private acceptance $conclusion" -f "output[summary]=$summary"
