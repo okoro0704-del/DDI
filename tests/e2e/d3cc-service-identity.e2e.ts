@@ -117,7 +117,7 @@ describe("D3C-C: Portal -> Master Distributor service identity, replay and idemp
 
     // ---- Master Distributor A and B (shared database) ----
     const mdReset = new Pool({ connectionString: mdDb, max: 1 });
-    await mdReset.query("DROP TABLE IF EXISTS md_service_token_replay, md_deliveries, md_uploads, app_latest, app_releases, ssl_certificates, domain_mappings, schema_migrations CASCADE");
+    await mdReset.query("DROP TABLE IF EXISTS md_tenant_bootstraps, md_service_token_replay, md_deliveries, md_uploads, app_latest, app_releases, ssl_certificates, domain_mappings, schema_migrations CASCADE");
     await mdReset.end();
     const mdModule = await importFrom(MD_ROOT, "/src/app.ts");
     const { createApp, createEngineDeps } = (mdModule.default ?? mdModule) as { createApp: Function; createEngineDeps: Function };

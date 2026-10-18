@@ -34,7 +34,8 @@ export async function composeRuntime(env: NodeJS.ProcessEnv = process.env) {
   const service = new DurableDdiService(
     repository,
     authorityVerifier(new HttpDigiAuthorityClient({ consumeUrl: new URL("/v1/authority/consume", config.digiAuthorityUrl).href, jwksUrl: config.digiAuthorityJwksUrl, verifierModuleUrl: config.digiAuthorityVerifierModuleUrl })),
-    defaultAdapters(assertion => identityVerifier.verify(assertion)),
+    // ElfCom settings come only from the validated configuration; unset means the primitive is unavailable.
+    defaultAdapters(assertion => identityVerifier.verify(assertion), { baseUrl: config.elfcomBaseUrl ?? "", serviceToken: config.elfcomPdiServiceToken ?? "" }),
     new HttpDigiSessionClient(config.digiCoreUrl),
     new HttpDigiAuthorityGrantClient(config.digiAuthorityUrl),
     ownership,

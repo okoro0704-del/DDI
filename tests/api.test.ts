@@ -101,6 +101,20 @@ test("production composition fails closed without postgres or digi configuration
   await assert.rejects(composeRuntime({ DDI_ENV: "production", DATABASE_URL: "postgres://127.0.0.1:1/ddi", TRUSTID_ISSUER: "https://issuer.test", TRUSTID_AUDIENCE: "aud", TRUSTID_JWKS_URL: "https://issuer.test/jwks", TRUSTID_BRIDGE_MODULE_URL: new URL("./fixtures/verifier-stub.mjs", import.meta.url).href, DDI_ALLOWED_ORIGINS: "https://app.example.test", DIGI_CORE_URL: "http://127.0.0.1:9", DIGI_AUTHORITY_URL: "http://127.0.0.1:9", DIGI_AUTHORITY_JWKS_URL: "http://127.0.0.1:9/jwks", DIGI_AUTHORITY_VERIFIER_MODULE_URL: new URL("./fixtures/verifier-stub.mjs", import.meta.url).href, PORTAL_OWNERSHIP_URL: "https://portal.example.test/internal/ddi/ownership/verify", PORTAL_OWNERSHIP_SHARED_SECRET: "test-only-shared-secret", ...ephemeralDdiIdentity() }), /DDI_POSTGRES_UNAVAILABLE/);
 });
 
+test("the ElfCom bearer is never configured for an unsafe URL (D3D-A security closure)", () => {
+  const dev = (url: string) => readConfig({ DDI_ENV: "test", ELFCOM_BASE_URL: url, ELFCOM_PDI_SERVICE_TOKEN: "t" });
+  assert.equal(dev("http://127.0.0.1:8791").elfcomBaseUrl, "http://127.0.0.1:8791");
+  for (const url of ["ftp://elfcom.example", "https://user:pass@elfcom.example", "https://elfcom.example/?token=x", "https://elfcom.example/#x", "not a url"]) {
+    assert.throws(() => dev(url), /DDI_PRODUCTION_CONFIGURATION_INVALID/, url);
+  }
+  // Production: https, or plain http only to loopback or Railway private networking.
+  const base = { DDI_ENV: "production", DATABASE_URL: "postgresql://ddi@127.0.0.1/ddi", TRUSTID_ISSUER: "i", TRUSTID_AUDIENCE: "a", TRUSTID_JWKS_URL: "https://j", TRUSTID_BRIDGE_MODULE_URL: "file:///b", DDI_ALLOWED_ORIGINS: "https://o", DIGI_CORE_URL: "https://c", DIGI_AUTHORITY_URL: "https://a", DIGI_AUTHORITY_JWKS_URL: "https://a/j", DIGI_AUTHORITY_VERIFIER_MODULE_URL: "file:///v", PORTAL_OWNERSHIP_URL: "https://p", ...ephemeralDdiIdentity() };
+  for (const url of ["https://elfcom.example", "http://elfcom.railway.internal:8791", "http://127.0.0.1:8791"]) assert.doesNotThrow(() => readConfig({ ...base, ELFCOM_BASE_URL: url }), url);
+  assert.throws(() => readConfig({ ...base, ELFCOM_BASE_URL: "http://elfcom.example" }), /DDI_PRODUCTION_CONFIGURATION_INVALID/);
+  assert.doesNotThrow(() => readConfig(base), "ElfCom stays optional: unset means the primitive is unavailable");
+  assert.equal(readConfig(base).elfcomBaseUrl, undefined);
+});
+
 test("session and authority clients fail closed and do not consume a rejected token", async () => {
   const sessions = new HttpDigiSessionClient("http://digi.test", async (_input, init) => new Headers(init?.headers).get("authorization") === "Bearer good" ? json({ ownerId: "own_from_digi", sessionId: "ses_1" }) : new Response(null, { status: 401 }));
   assert.equal((await sessions.resolve("good"))?.ownerId, "own_from_digi");

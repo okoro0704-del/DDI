@@ -1,0 +1,26 @@
+{
+  "name": "ddi-workflow-events",
+  "enforcement": "active",
+  "conditions": {
+    "workflow_path": {
+      "include": [
+        "~ALL"
+      ],
+      "exclude": [
+        ".github/workflows/ci-safety-gate.yml"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "restrict_action_events",
+      "parameters": {
+        "allowed_events": [
+          "push",
+          "pull_request",
+          "workflow_dispatch"
+        ]
+      }
+    }
+  ]
+}

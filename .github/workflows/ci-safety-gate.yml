@@ -1,0 +1,67 @@
+# DDI trusted CI review of pull requests (D3D-A security closure, proposed).
+#
+# Execution context: since 2025-12-08 GitHub runs every `pull_request_target` workflow from the
+# repository's DEFAULT branch (workflow file, GITHUB_REF and GITHUB_SHA), whatever the pull request's
+# base. This file and the gate script are therefore the trust root only once they are on the default
+# branch, and a pull request can neither edit nor skip the review that judges it.
+#
+# It never executes pull-request code: the pull request's workflow files, and its base's, are checked
+# out only as data (nothing else from either), nothing from them is installed or run, no pull-request
+# text is interpolated into a shell, the token is read-only and not persisted, and no secrets or caches
+# are used. actions/checkout v7 refuses fork pull-request checkouts in `pull_request_target` unless
+# `allow-unsafe-pr-checkout` is set; this file pins v4.2.2 by SHA and reads that checkout as data only.
+#
+# Activation needs separate approvals: (1) merge into the default branch; (2) a repository Actions
+# policy allowing `pull_request_target` for this file only (GitHub enforces a default policy blocking
+# it on public repositories from 2026-11-02); (3) a ruleset requiring the `ddi-trusted-ci-review`
+# check from GitHub Actions. The gate refuses any pull-request workflow that could publish that name.
+name: DDI trusted CI review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  ddi-trusted-ci-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: trusted
+          sparse-checkout: |
+            scripts/ci
+            .github/workflows
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: untrusted
+          sparse-checkout: /.github/workflows/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          sparse-checkout: /.github/workflows/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Review the pull request's workflows (default-branch gate; pull-request files are data only)
+        # The trusted script parses every pull-request workflow itself (never guessing triggers), reads
+        # each file without following symlinks, requires the runtime gate in every workflow a pull
+        # request can trigger, refuses changes to this review and any workflow that could report under
+        # its name, and judges removals against the pull request's base.
+        run: >-
+          node trusted/scripts/ci/assert-ci-safety.mjs --static
+          --workflows-dir untrusted/.github/workflows
+          --base-workflows-dir base/.github/workflows
+          --exclude ci-safety-gate.yml
+          --require d3-cross-repo-acceptance.yml
+          --self trusted/.github/workflows/ci-safety-gate.yml
