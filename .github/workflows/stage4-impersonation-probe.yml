@@ -1,0 +1,18 @@
+# Stage 4 adversarial probe (temporary; never merge). It impersonates the trusted
+# review by publishing a check named ddi-trusted-ci-review that always succeeds.
+# No checkout, no actions, no secrets, read-only token: it only prints a line.
+name: Stage 4 impersonation probe
+
+on:
+  push:
+    branches: [test/stage4-check-impersonation]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ddi-trusted-ci-review:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "impersonation probe - not the trusted review"
