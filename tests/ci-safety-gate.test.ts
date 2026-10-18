@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // @ts-expect-error -- plain ESM script without type declarations
-import { parseWorkflowYaml, runGate, stripComments } from "../scripts/ci/assert-ci-safety.mjs";
+import { parseWorkflowYaml, RESERVED_CHECK_NAMES, runGate, stripComments } from "../scripts/ci/assert-ci-safety.mjs";
 
 /**
  * D3D-B1 adversarial tests for the CI safety gate. Each case applies one hostile edit to the real
@@ -102,7 +102,7 @@ describe("runtime gate step is required, trusted and cannot be bypassed", () => 
 
   test("nothing may run before the gate or hijack the interpreter", () => {
     fails(review(edit("      # The gate runs from the default", "      - run: cp evil.mjs trusted-gate/scripts/ci/assert-ci-safety.mjs\n      # The gate runs from the default")), /only pinned checkout and setup-node steps may come before the gate|gate step must run/);
-    fails(review(edit("env:\n  PORTAL_SHA:", "env:\n  NODE_OPTIONS: --require ./ddi/evil.js\n  PORTAL_SHA:")), /NODE_OPTIONS can change what the gate runs/);
+    fails(review(edit("env:\n  MD_SHA:", "env:\n  NODE_OPTIONS: --require ./ddi/evil.js\n  MD_SHA:")), /NODE_OPTIONS can change what the gate runs/);
     fails(review(edit("    env:\n      NODE_ENV: test", "    env:\n      BASH_ENV: ddi/evil.sh\n      NODE_ENV: test")), /BASH_ENV can change what the gate runs/);
     fails(review(edit("    runs-on: ubuntu-latest", "    runs-on: ubuntu-latest\n    container: attacker/node")), /'container' is not allowed/);
     fails(review(edit("          node-version: 22", "          node-version: 22\n          node-version-file: ddi/.nvmrc")), /setup-node before the gate may set only node-version/);
@@ -120,6 +120,17 @@ describe("runtime gate step is required, trusted and cannot be bypassed", () => 
     fails(review(edit("repository: okoro0704-del/MasternDistribution", "repository: attacker/MasternDistribution")), /not an approved dependency/);
   });
 
+  test("the private LifeOS Portal is never fetched by a pull-request job, with or without a credential (Stage 5C)", () => {
+    const portal = "      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n        with:\n          repository: okoro0704-del/LifeOS-Portal\n          ref: ${{ env.PORTAL_SHA }}\n          path: portal\n          persist-credentials: false\n";
+    const withPortal = edit("env:\n  MD_SHA:", `env:\n  PORTAL_SHA: ${"3".repeat(40)}\n  MD_SHA:`)
+      .replace("      - uses: actions/setup-node", `${portal}      - uses: actions/setup-node`)
+      .replace("--pin md=", "--pin portal=${{ env.PORTAL_SHA }} \\\n          --pin md=");
+    fails(review(withPortal), /repository okoro0704-del\/LifeOS-Portal is not an approved dependency/);
+    const withToken = withPortal.replace("          path: portal\n", "          path: portal\n          token: ${{ secrets.PORTAL_READ_TOKEN }}\n");
+    fails(review(withToken), /references secrets/);
+    assert.doesNotMatch(REAL, /LifeOS-Portal/, "the public acceptance workflow no longer names the private repository");
+  });
+
   test("pins must cover every external checkout", () => {
     fails(review(edit("--pin trustid=${{ env.TRUSTID_SHA }} \\\n", "")), /gate must pin checkout 'trustid'|pins must match/);
     fails(review(edit("ref: ${{ env.MD_SHA }}", "ref: main")), /external checkouts must use ref/);
@@ -133,6 +144,12 @@ describe("runtime gate step is required, trusted and cannot be bypassed", () => 
     fails(review(REAL.replace(/^on:\n[\s\S]*?\n(?=permissions:)/m, "on: { pull_request: {} }\n")), /not in the supported workflow syntax/);
     fails(review(edit("permissions:\n  contents: read\n", "permissions:\n  contents: read\npermissions:\n  contents: read\n")), /duplicate or forbidden key/);
     fails(review(edit("    runs-on: ubuntu-latest", "\truns-on: ubuntu-latest")), /tab indentation/);
+  });
+
+  test("the empty mapping {} reads as GitHub reads it; other flow mappings stay refused (Stage 5C)", () => {
+    assert.deepEqual({ ...parseWorkflowYaml("permissions: {}\n").permissions }, {});
+    assert.throws(() => parseWorkflowYaml("permissions: { contents: read }\n"), /flow mappings are not allowed/);
+    fails(review(edit("permissions:\n  contents: read\n", "permissions: {}\n")), /permissions must be exactly 'contents: read'/);
   });
 
   test("workflows pull requests cannot trigger only need to parse and avoid privileged triggers", () => {
@@ -291,6 +308,14 @@ describe("nothing in a pull request can report under the trusted review's name",
     fails(scan({ "push.yml": push('  build:\n    name: " DDI-trusted-ci-review"\n') }), /would publish a check named like the trusted review/);
     assert.deepEqual(scan({ "push.yml": push("  build:\n", "permissions:\n  contents: read\n  statuses: read\n") }), [], "read access stays allowed");
   });
+
+  test("no job may publish the private acceptance runner's reserved check, in any spelling (Stage 5C)", () => {
+    assert.ok(RESERVED_CHECK_NAMES.has("ddi-private-acceptance"));
+    fails(scan({ "push.yml": push("  ddi-private-acceptance:\n") }), /reserved name ddi-private-acceptance/);
+    fails(scan({ "push.yml": push('  build:\n    name: " DDI-Private-Acceptance "\n') }), /reserved name ddi-private-acceptance/);
+    fails(scan({ [NAME]: REAL.replace("  acceptance:\n    runs-on", "  acceptance:\n    name: ddi-private-acceptance\n    runs-on") }), /reserved name ddi-private-acceptance/);
+    assert.deepEqual(scan({ "push.yml": push("  ddi-private-acceptance-notes:\n") }), [], "only the exact check name is reserved");
+  });
 });
 
 describe("runtime environment (unchanged guarantees)", () => {
@@ -324,7 +349,7 @@ describe("runtime environment (unchanged guarantees)", () => {
   test("helpers: comments stripped only outside quotes; the parser reads the real workflow", () => {
     assert.equal(stripComments('run: echo "a # b" # tail'), 'run: echo "a # b" ');
     const doc = parseWorkflowYaml(REAL);
-    assert.equal(doc.jobs.acceptance.steps[6].with.ref, TRUSTED_REF);
+    assert.equal(doc.jobs.acceptance.steps[5].with.ref, TRUSTED_REF);
   });
 });
 
