@@ -185,6 +185,14 @@ export async function executeCapability(input: {
   request.connectionId = connection.id;
   if (connection.status !== "ACTIVE" && connection.status !== "REQUESTED_CHANGE") return finish({ status: "DENIED", correlationId: request.correlationId, reason: "CONNECTION_NOT_ACTIVE" });
   if (!connection.approvedCapabilities.includes(request.capability)) return finish({ status: "DENIED", correlationId: request.correlationId, reason: "CAPABILITY_NOT_APPROVED" });
+  // The application credential must not be able to replay a grant binding
+  // issued for another app, a legacy PDI-wide resource, or another property.
+  if (app.propertyId) {
+    const expectedGrant = connection.authorityGrantRefs.find(ref => ref.capability === request.capability);
+    if (!expectedGrant || request.actor.authorityActor !== expectedGrant.actor || request.action !== expectedGrant.action || request.resource !== expectedGrant.resource || request.audience !== expectedGrant.audience) {
+      return finish({ status: "DENIED", correlationId: request.correlationId, reason: "AUTHORITY_BINDING_MISMATCH" });
+    }
+  }
   let decision: AuthorityDecision;
   try { decision = await input.authority({ request, infrastructure: infra }); }
   catch { return finish({ status: "FAILED", correlationId: request.correlationId, reason: "AUTHORITY_UNAVAILABLE" }); }

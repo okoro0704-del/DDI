@@ -55,6 +55,12 @@ describe("PDI communication primitive binding", { concurrency: 1 }, () => {
     await migrate(pool, join("migrations", "001_ddi_foundation.sql"));
     await migrate(pool, join("migrations", "002_ddi_runtime.sql"));
     await migrate(pool, join("migrations", "003_pdi_connections.sql"));
+    await migrate(pool, join("migrations", "004_connected_properties.sql"));
+    await migrate(pool, join("migrations", "005_commercial_activation.sql"));
+    await migrate(pool, join("migrations", "006_commercial_recovery.sql"));
+    await migrate(pool, join("migrations", "007_portal_install_state.sql"));
+    await migrate(pool, join("migrations", "008_download_grant_version.sql"));
+    await migrate(pool, join("migrations", "009_service_token_replay.sql"));
     repository = new PostgresDdiRepository(pool);
     process.env.ELFCOM_BASE_URL = BASE;
     process.env.ELFCOM_PDI_SERVICE_TOKEN = SERVICE_TOKEN;

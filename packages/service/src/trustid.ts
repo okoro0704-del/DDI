@@ -1,4 +1,3 @@
-import { pathToFileURL } from "node:url";
 export type TrustIdAssertionVerifier = { verify(assertion: string): Promise<{ subject: string } | null>; health(): Promise<"CONNECTED" | "DEGRADED" | "UNAVAILABLE"> };
 type DigiBridge = { createJwksCache(input: { jwksUrl: string }): unknown; verifyDigiAssertion(input: { assertion: string; expectedIssuer: string; expectedAudience: string; jwks: unknown }): Promise<{ ok: boolean; subject?: string }> };
 /** Uses TrustID's canonical @trustid/digi-bridge verification implementation. */
@@ -12,4 +11,3 @@ export class CanonicalTrustIdVerifier implements TrustIdAssertionVerifier {
   }
   async health() { try { const response = await fetch(this.options.jwksUrl, { headers: { accept: "application/json" } }); return response.ok ? "CONNECTED" as const : "DEGRADED" as const; } catch { return "UNAVAILABLE" as const; } }
 }
-export function defaultTrustBridgeUrl() { return pathToFileURL("C:/Users/Hp/Desktop/TRUST ID/packages/digi-bridge/dist/index.js").href; }
