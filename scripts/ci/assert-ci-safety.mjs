@@ -39,9 +39,12 @@
  *     reusable-workflow jobs, or interpreter-hijacking environment variables).
  *   - Check integrity (with --self; every workflow in the directory, whatever its trigger, because
  *     pushes to a same-repository branch run on the pull request's head commit): no job may publish a
- *     check named like a job of the trusted review, job names may not use expressions, and no workflow
- *     may grant `checks` or `statuses` write (or `write-all`), so nothing in a pull request can report
- *     a result under the trusted review's name.
+ *     check named like a job of the trusted review or a reserved check (RESERVED_CHECK_NAMES), job
+ *     names may not use expressions, and no workflow may grant `checks` or `statuses` write (or
+ *     `write-all`), so nothing in a pull request can report a result under the trusted review's name
+ *     or the private acceptance runner's.
+ *   - Dependencies: pull-request jobs check out only the public sibling repositories. LifeOS Portal is
+ *     private; its suites run only in the private acceptance runner (docs/phase-d3d-a-private-acceptance.md).
  *   - Paths: the workflows directory and every component above it are real directories inside the
  *     working directory; entries are regular `.yml`/`.yaml` files, never symlinks or other types.
  */
@@ -50,7 +53,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, read
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-const HOSTED = /(\.railway\.(app|internal)|getlifeos\.app|netlify\.app|\.supabase\.co|lucid-integrity|distribution-hub-production)/i;
+export const HOSTED =/(\.railway\.(app|internal)|getlifeos\.app|netlify\.app|\.supabase\.co|lucid-integrity|distribution-hub-production)/i;
 const CREDENTIAL_NAME = /(SECRET|PRIVATE_KEY|TOKEN|PASSWORD|API_KEY|CREDENTIAL)/i;
 const URL_PATTERN = /\b(?:https?|postgres(?:ql)?|redis|mysql|mongodb(?:\+srv)?|amqps?|wss?):\/\/[^\s"']+/gi;
 const actionsHost = (host) => host === "actions.githubusercontent.com" || host.endsWith(".actions.githubusercontent.com");
@@ -83,8 +86,16 @@ const GATE_PREAMBLE = [
   `node ${GATE_SCRIPT} \\`,
 ];
 const PINNED_ACTION = (name) => new RegExp(`^actions/${name}@[0-9a-f]{40}$`);
-/** Repositories an acceptance job may check out besides itself (each still pinned to a full SHA). */
-const EXTERNAL_REPOSITORIES = new Set(["okoro0704-del/LifeOS-Portal", "okoro0704-del/MasternDistribution", "okoro0704-del/TRUSTID", "okoro0704-del/elfCOM"]);
+/**
+ * Public repositories an acceptance job may check out besides itself (each still pinned to a full SHA).
+ * LifeOS Portal is private and never listed: a pull-request job holds no credential that could fetch it.
+ */
+const EXTERNAL_REPOSITORIES = new Set(["okoro0704-del/MasternDistribution", "okoro0704-del/TRUSTID", "okoro0704-del/elfCOM"]);
+/**
+ * Check names reported from outside this repository's workflows: the private acceptance runner's
+ * GitHub App posts `ddi-private-acceptance`. No workflow here may publish a check under one of them.
+ */
+export const RESERVED_CHECK_NAMES = new Set(["ddi-private-acceptance"]);
 /**
  * Service containers start before any step. Only the digest-pinned disposable PostgreSQL image, with
  * health-check options and no volumes, may run; anything else could rewrite the workspace (including
@@ -110,9 +121,10 @@ export function stripComments(text) {
 
 /**
  * Strict YAML-subset parser for workflow files: block mappings and sequences, plain and quoted
- * scalars, block scalars, single-line flow sequences. Anything else (anchors, aliases, tags, flow
- * mappings, quoted or complex keys, duplicate keys, tab indentation, multiple documents) throws, so
- * an unusual construct can never be read differently here than by GitHub.
+ * scalars, block scalars, single-line flow sequences and the empty mapping `{}`. Anything else
+ * (anchors, aliases, tags, non-empty flow mappings, quoted or complex keys, duplicate keys, tab
+ * indentation, multiple documents) throws, so an unusual construct can never be read differently
+ * here than by GitHub.
  */
 export function parseWorkflowYaml(source) {
   const raw = source.replace(/\r\n?/g, "\n").split("\n");
@@ -153,6 +165,7 @@ export function parseWorkflowYaml(source) {
       return value.endsWith("-") ? text : `${text}\n`;
     }
     if (/^[&*!%@`]/.test(value)) fail("anchors, aliases, tags and reserved indicators are not allowed");
+    if (value === "{}") return Object.create(null);
     if (value.startsWith("{")) fail("flow mappings are not allowed");
     if (value.startsWith("[")) {
       if (!value.endsWith("]")) fail("flow sequences must be on one line");
@@ -489,7 +502,9 @@ function reviewCheckIntegrity(doc, text, file, trusted, failures) {
     const jobName = isMap(job) && job.name !== undefined && job.name !== null ? String(job.name) : undefined;
     if (jobName !== undefined && jobName.includes("${{")) failures.push(`${name} job ${jobId}: job names may not use expressions (one could resolve to the trusted review's check name)`);
     for (const candidate of [jobId, jobName]) {
-      if (candidate !== undefined && trusted.has(checkName(candidate))) failures.push(`${name} job ${jobId}: would publish a check named like the trusted review (${candidate.trim()})`);
+      if (candidate === undefined) continue;
+      if (trusted.has(checkName(candidate))) failures.push(`${name} job ${jobId}: would publish a check named like the trusted review (${candidate.trim()})`);
+      else if (RESERVED_CHECK_NAMES.has(checkName(candidate))) failures.push(`${name} job ${jobId}: would publish a check under the reserved name ${checkName(candidate)} (only the private acceptance runner reports it)`);
     }
   }
 }

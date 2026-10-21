@@ -1,4 +1,5 @@
-# D3 cross-repository acceptance (D3D-A, proposed). Tests only: no deployment, no secrets, no hosted endpoints.
+# D3 cross-repository acceptance, public dependencies (D3D-A). Tests only: no deployment, no secrets,
+# no hosted endpoints.
 #
 # Untrusted pull-request code runs here, so:
 # - triggers are `pull_request` and `workflow_dispatch` only (never pull_request_target / workflow_run);
@@ -8,10 +9,15 @@
 # - every database is a disposable PostgreSQL 16 service container on loopback; the safety gate refuses
 #   any non-loopback or hosted endpoint, any credential-shaped variable and any unpinned checkout.
 # Sibling repositories are public and pinned to full commit SHAs; bump a pin only after that commit is
-# reviewed. Activation: this file does nothing until it is pushed; `workflow_dispatch` additionally
-# requires it on the default branch. The runtime gate's trusted copy comes from the default branch, the
-# same single trust root GitHub uses for the `pull_request_target` review that keeps this job honest.
-name: D3 cross-repository acceptance
+# reviewed, together with the same pin in the private runner's acceptance workflow
+# (docs/ci/private-acceptance/runner/.github/workflows/ddi-acceptance.yml).
+# LifeOS Portal is private, so the Portal suites and the D3 end-to-end acceptance run only in the private
+# acceptance runner (docs/phase-d3d-a-private-acceptance.md), which reports to DDI as the check
+# `ddi-private-acceptance` from its own GitHub App; nothing here can fetch Portal or report that check.
+# Activation: this file does nothing until it is pushed; `workflow_dispatch` additionally requires it
+# on the default branch. The runtime gate's trusted copy comes from the default branch, the same single
+# trust root GitHub uses for the `pull_request_target` review that keeps this job honest.
+name: D3 cross-repository acceptance (public dependencies)
 
 on:
   pull_request:
@@ -22,6 +28,7 @@ on:
       - "packages/**"
       - "scripts/**"
       - "tests/**"
+      - "docs/ci/private-acceptance/**"
       - "package.json"
       - "package-lock.json"
   workflow_dispatch:
@@ -34,7 +41,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PORTAL_SHA: 316a07b7ad94f5a5eacff790906aa879537439ef
   MD_SHA: e46366696e1b75062dde0a27fa8dca0074ef724c
   TRUSTID_SHA: 8bf7852d14fe91ba28670768c7f3b2c898ce581b
   ELFCOM_SHA: f0b7e7213e4b0c8bf0efe560212ec1cd3764bdbf
@@ -61,8 +67,6 @@ jobs:
       NODE_ENV: test
       PGBASE: postgresql://d3_test:${{ github.run_id }}@127.0.0.1:5432
       DDI_TEST_DATABASE_URL: postgresql://d3_test:${{ github.run_id }}@127.0.0.1:5432/ddi_test
-      PORTAL_ROOT: ${{ github.workspace }}/portal
-      MD_ROOT: ${{ github.workspace }}/md
       DDI_TRUSTID_ROOT: ${{ github.workspace }}/trustid
       DDI_ELFCOM_ROOT: ${{ github.workspace }}/elfcom
       TRUSTID_BRIDGE_MODULE_URL: file://${{ github.workspace }}/trustid/packages/digi-bridge/dist/index.js
@@ -71,12 +75,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: ddi
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: okoro0704-del/LifeOS-Portal
-          ref: ${{ env.PORTAL_SHA }}
-          path: portal
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -119,17 +117,15 @@ jobs:
           fi
           node trusted-gate/scripts/ci/assert-ci-safety.mjs \
           --workflow ddi/.github/workflows/d3-cross-repo-acceptance.yml \
-          --pin portal=${{ env.PORTAL_SHA }} \
           --pin md=${{ env.MD_SHA }} \
           --pin trustid=${{ env.TRUSTID_SHA }} \
           --pin elfcom=${{ env.ELFCOM_SHA }}
 
-      - name: Install and build dependencies (TrustID, ElfCom, DDI, Portal, Master Distributor)
+      - name: Install and build dependencies (TrustID, ElfCom, DDI, Master Distributor)
         run: |
           (cd trustid && npm ci --no-audit --no-fund && npm run build:security && npm run build -w @trustid/digi-rp)
           (cd elfcom && npm ci --no-audit --no-fund && npm run build -w @elfcom/node)
           (cd ddi && npm ci --no-audit --no-fund)
-          (cd portal && npm ci --no-audit --no-fund && for w in shared env finprove offline-kernel; do npm run build -w @lifeos-portal/$w; done)
           (cd md && npm ci --no-audit --no-fund)
 
       - name: Create disposable databases
@@ -139,23 +135,12 @@ jobs:
           import pg from 'pg';
           const admin = new pg.Client({ connectionString: process.env.DDI_TEST_DATABASE_URL });
           await admin.connect();
-          for (const db of ['portal_unit', 'portal_pgtest', 'md_unit', 'portal_d3cb', 'md_d3cb', 'portal_d3cc', 'md_d3cc', 'portal_d3da', 'md_d3da', 'portal_recovery']) await admin.query('CREATE DATABASE ' + db);
+          for (const db of ['md_unit']) await admin.query('CREATE DATABASE ' + db);
           await admin.end();"
 
-      - name: DDI (typecheck and PostgreSQL suite)
+      - name: DDI (typecheck, PostgreSQL suite, CI gate and private acceptance reviews)
         working-directory: ddi
         run: npm run typecheck && npm test
-
-      - name: Portal (typecheck, D3 integration, install claims and recovery, PostgreSQL store)
-        working-directory: portal
-        env:
-          PORTAL_TEST_DATABASE_URL: ${{ env.PGBASE }}/portal_unit
-          PORTAL_RECOVERY_DATABASE_URL: ${{ env.PGBASE }}/portal_recovery
-          PORTAL_REQUIRE_DATABASE_TESTS: "1"
-        run: |
-          npx tsc --noEmit -p apps/portal-api
-          npm run test:d3
-          PORTAL_TEST_DATABASE_URL=${{ env.PGBASE }}/portal_pgtest npm run test:postgres
 
       - name: Master Distributor (typecheck, migration compatibility, full suite with PostgreSQL)
         working-directory: md
@@ -163,24 +148,3 @@ jobs:
           MD_TEST_DATABASE_URL: ${{ env.PGBASE }}/md_unit
           MD_REQUIRE_DATABASE_TESTS: "1"
         run: npx tsc --noEmit && node scripts/ci/check-additive-migrations.js && npx jest --runInBand
-
-      - name: D3C-B acceptance (commercial activation, provisioning, fulfilment)
-        working-directory: portal
-        env:
-          PORTAL_E2E_DATABASE_URL: ${{ env.PGBASE }}/portal_d3cb
-          MD_E2E_DATABASE_URL: ${{ env.PGBASE }}/md_d3cb
-        run: node --import tsx --test --test-concurrency=1 --test-timeout=240000 ../ddi/tests/e2e/d3cb-acceptance.e2e.ts
-
-      - name: D3C-C acceptance (service identity, shared replay, cross-instance idempotency)
-        working-directory: portal
-        env:
-          PORTAL_E2E_DATABASE_URL: ${{ env.PGBASE }}/portal_d3cc
-          MD_E2E_DATABASE_URL: ${{ env.PGBASE }}/md_d3cc
-        run: node --import tsx --test --test-concurrency=1 --test-timeout=240000 ../ddi/tests/e2e/d3cc-service-identity.e2e.ts
-
-      - name: D3D-A acceptance (crash between MD success and Portal completion, real processes)
-        working-directory: portal
-        env:
-          PORTAL_E2E_DATABASE_URL: ${{ env.PGBASE }}/portal_d3da
-          MD_E2E_DATABASE_URL: ${{ env.PGBASE }}/md_d3da
-        run: node --import tsx --test --test-concurrency=1 --test-timeout=300000 ../ddi/tests/e2e/d3da-crash-recovery.e2e.ts
